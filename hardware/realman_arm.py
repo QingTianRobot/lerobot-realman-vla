@@ -21,8 +21,12 @@
   python hardware/realman_arm.py [--arm-ip 192.168.5.123] [--arm-port 8080]
   python hardware/realman_arm.py --scan          # 扫网段列出候选机械臂
   python hardware/realman_arm.py --scan --all    # 扫描并逐台读状态
+  python hardware/realman_arm.py --read-init           # 读当前位姿→打印 ROBOT_INIT 粘贴行
+  python hardware/realman_arm.py --read-init --write   # 读当前位姿→直接写入 collect_data.py
 """
 
+import os
+import re
 import socket
 import subprocess
 import argparse
@@ -31,6 +35,8 @@ from concurrent.futures import ThreadPoolExecutor
 DEFAULT_ARM_IP = "192.168.5.123"
 DEFAULT_ARM_PORT = 8080
 DEFAULT_SUBNET = "192.168.5"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_COLLECT_SCRIPT = os.path.join(_REPO_ROOT, "scripts", "collect_data.py")
 
 
 def local_ips():
@@ -71,7 +77,7 @@ def read_arm(ip, port=DEFAULT_ARM_PORT):
     """只读连接机械臂并读取状态/机型/固件。返回 dict; 不产生任何运动。"""
     from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
     res = {"ip": ip, "connect": False, "state_code": None,
-           "joint": None, "model": None, "product": None}
+           "joint": None, "pose": None, "model": None, "product": None}
     arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
     try:
         handle = arm.rm_create_robot_arm(ip, port)
@@ -83,6 +89,9 @@ def read_arm(ip, port=DEFAULT_ARM_PORT):
         res["state_code"] = code
         if code == 0:
             res["joint"] = [round(float(x), 3) for x in state.get("joint", [])]
+            pose = state.get("pose")
+            if pose:
+                res["pose"] = [round(float(x), 4) for x in pose]
         try:
             _, info = arm.rm_get_robot_info()
             res["model"] = info.get("arm_model")
@@ -143,6 +152,72 @@ def self_test(ip, port):
     return healthy
 
 
+def write_robot_init(pose, target=None):
+    """把 pose 原地写入 collect_data.py 的 ROBOT_INIT_POS / ROBOT_INIT_ORI 两行。
+
+    只替换这两行的 np.array([...]) 内容; 定位不到就放弃修改 (不破坏文件)。
+    """
+    target = target or DEFAULT_COLLECT_SCRIPT
+    if not os.path.isfile(target):
+        print(f"[!] 目标文件不存在: {target}")
+        return False
+    with open(target, "r", encoding="utf-8") as f:
+        src = f.read()
+
+    pat_pos = re.compile(r"^ROBOT_INIT_POS = np\.array\(\[[^\]]*\]\)", re.M)
+    pat_ori = re.compile(r"^ROBOT_INIT_ORI = np\.array\(\[[^\]]*\]\)", re.M)
+    m_pos, m_ori = pat_pos.search(src), pat_ori.search(src)
+    if not m_pos or not m_ori:
+        print(f"[!] 在 {target} 未定位到 ROBOT_INIT_POS/ORI 行, 未修改")
+        return False
+
+    new_pos = f"ROBOT_INIT_POS = np.array([{pose[0]}, {pose[1]}, {pose[2]}])"
+    new_ori = f"ROBOT_INIT_ORI = np.array([{pose[3]}, {pose[4]}, {pose[5]}])"
+    src = pat_pos.sub(lambda _: new_pos, src, count=1)
+    src = pat_ori.sub(lambda _: new_ori, src, count=1)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(src)
+
+    print("-" * 50)
+    print(f"[✓] 已写入 {os.path.relpath(target, _REPO_ROOT)}:")
+    print(f"    {m_pos.group(0)}\n -> {new_pos}")
+    print(f"    {m_ori.group(0)}\n -> {new_ori}")
+    return True
+
+
+def read_init(ip, port, write=False, target=None):
+    """只读当前笛卡尔位姿; 默认打印可粘贴行, --write 时直接写入 collect_data.py。
+
+    用途: 手动把机械臂拖到安全顺手的遥操起始位后运行本命令, 更新 scripts/collect_data.py
+    里的 ROBOT_INIT_POS / ROBOT_INIT_ORI。全程不下发任何运动指令。
+    """
+    if not check_tcp(ip, port):
+        print(f"[!] TCP {ip}:{port} 不可达 —— 机械臂没上电/IP 不对; 用 --scan 定位真实机械臂。")
+        return False
+
+    r = read_arm(ip, port)
+    pose = r.get("pose")
+    if not r["connect"] or r["state_code"] != 0 or not pose or len(pose) < 6:
+        print(f"[!] 读取位姿失败: connect={r['connect']} code={r['state_code']} "
+              f"pose={pose} {('err=' + r['error']) if r.get('error') else ''}")
+        return False
+
+    print("=" * 50)
+    print(f"  当前笛卡尔位姿  target={ip}:{port}")
+    print("=" * 50)
+    print(f"[✓] pose [x,y,z, rx,ry,rz] (米/弧度) = {pose}")
+    print(f"[i] 关节角(°) = {r['joint']}")
+
+    if write:
+        return write_robot_init(pose, target)
+
+    print("-" * 50)
+    print("把下面两行粘贴到 scripts/collect_data.py, 覆盖 ROBOT_INIT_POS / ROBOT_INIT_ORI:")
+    print(f"ROBOT_INIT_POS = np.array([{pose[0]}, {pose[1]}, {pose[2]}])")
+    print(f"ROBOT_INIT_ORI = np.array([{pose[3]}, {pose[4]}, {pose[5]}])")
+    return True
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="睿尔曼 RM65 机械臂只读自检 (不下发运动)")
     parser.add_argument("--arm-ip", type=str, default=DEFAULT_ARM_IP)
@@ -153,6 +228,12 @@ if __name__ == "__main__":
                         help="扫网段列出所有开放机械臂端口的主机")
     parser.add_argument("--all", action="store_true",
                         help="配合 --scan: 对每台候选逐台读状态")
+    parser.add_argument("--read-init", action="store_true",
+                        help="读当前笛卡尔位姿, 打印可粘贴到 collect_data.py 的 ROBOT_INIT_POS/ORI 行")
+    parser.add_argument("--write", action="store_true",
+                        help="配合 --read-init: 直接把读到的位姿写入 --target 的 collect_data.py")
+    parser.add_argument("--target", type=str, default=DEFAULT_COLLECT_SCRIPT,
+                        help="--write 要修改的 collect_data.py 路径 (默认 scripts/collect_data.py)")
     args = parser.parse_args()
 
     if args.scan:
@@ -164,5 +245,9 @@ if __name__ == "__main__":
                 print(f"  {ip}: connect={r['connect']} state_code={r['state_code']} "
                       f"joint={r['joint']} model={r['model']} product={r['product']}")
         raise SystemExit(0)
+
+    if args.read_init:
+        raise SystemExit(0 if read_init(args.arm_ip, args.arm_port,
+                                        write=args.write, target=args.target) else 1)
 
     raise SystemExit(0 if self_test(args.arm_ip, args.arm_port) else 1)
