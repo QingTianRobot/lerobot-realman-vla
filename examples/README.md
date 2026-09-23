@@ -25,8 +25,8 @@ with h5py.File('examples/sample_data/demo_0.hdf5', 'r') as f:
     print("=== HDF5 Structure ===")
     print(f"qpos:      {f['observations/qpos'].shape}")       # (N, 7)
     print(f"action:    {f['action'].shape}")                   # (N, 7)
-    print(f"cam_high:  {f['observations/images/cam_high'].shape}")  # (N, 480, 640, 3)
-    print(f"cam_wrist: {f['observations/images/cam_wrist'].shape}") # (N, 480, 640, 3)
+    print(f"cam_global: {f['observations/images/camera_global'].shape}")  # (N, 480, 640, 3)
+    print(f"cam_left:   {f['observations/images/camera_left'].shape}")   # (N, 480, 640, 3)
     print(f"FPS:       {f.attrs.get('fps', 'N/A')}")
     print(f"Frames:    {f['observations/qpos'].shape[0]}")
 ```

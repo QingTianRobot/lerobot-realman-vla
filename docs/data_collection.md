@@ -72,7 +72,15 @@ python hardware/realsense_camera.py --serial 262322074840
 
 ### 2.4 Vive Tracker
 
-启动 **SteamVR**，确认 tracker 在线（图标正常追踪）。采集脚本启动时会打印 `Vive: OK/FAIL`，`FAIL` 说明 SteamVR 没开或 tracker 没被追踪到。
+启动 **SteamVR**（`steam steam://rungameid/250820`），确认基站通电、tracker 在线。可单独自检：
+
+```bash
+python hardware/vive_tracker.py   # 打印发现的设备(hmd/tracker/基站)与实时位姿
+```
+
+采集脚本启动时会打印 `Vive: OK/FAIL`，`FAIL` 说明 SteamVR 没开或 tracker 没被追踪到。
+
+> **无头显**（只有 Tracker）时，SteamVR 默认要求 HMD，`vive_tracker.py` 会报 `Init_HmdNotFound`；需配置 null 假头显驱动后才能无头显追踪，详见 [硬件配置 README 的「无头显运行」](../hardware/README.md)。
 
 ---
 
@@ -96,20 +104,20 @@ python hardware/changingtek_gripper.py --slave-id 2 --calibrate --margin 0.02
 
 遥操把 tracker 的位姿增量映射到机械臂笛卡尔空间，需标定两处（**都在 [`collect_data.py`](../scripts/collect_data.py) 配置区/`_control_loop`，已加详细注释**）：
 
-**(a) `ROBOT_INIT_POS / ORI`** — tracker 在零点时机械臂应处的笛卡尔位姿（位置:米，姿态:弧度）。手动把机械臂移到安全顺手的起始位，读取当前位姿填入：
+**(a) `ROBOT_INIT_POS / ORI`** — tracker 在零点时机械臂应处的笛卡尔位姿（位置:米，姿态:弧度）。手动把机械臂拖到安全顺手的起始位，用只读工具读当前位姿：
 
 ```bash
-python - <<'PY'
-from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
-arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-arm.rm_create_robot_arm("192.168.5.123", 8080)
-code, state = arm.rm_get_current_arm_state()
-print("code:", code)
-print("pose [x,y,z, rx,ry,rz] (米/弧度) =", state.get("pose"))
-arm.rm_delete_robot_arm()
-PY
+# 只打印可直接粘贴的两行（默认，不改文件）
+python hardware/realman_arm.py --read-init
+# 读取后直接写入 collect_data.py 的 ROBOT_INIT_POS/ORI（一步到位）
+python hardware/realman_arm.py --read-init --write
 ```
-把 `pose` 前 3 个填 `ROBOT_INIT_POS`、后 3 个填 `ROBOT_INIT_ORI`。
+`pose` 前 3 个=位置(米)、后 3 个=姿态(弧度)；`--write` 只替换 [`collect_data.py`](../scripts/collect_data.py) 那两行的 `np.array([...])`，定位不到就放弃、不破坏文件。写入结果形如：
+
+```python
+ROBOT_INIT_POS = np.array([-0.4024, -0.0273, 0.1878])
+ROBOT_INIT_ORI = np.array([3.152, 0.149, -0.137])
+```
 > ⚠️ 不改这里，按 `w` 时机械臂会突跳到上一套实物的旧位姿。
 
 **(b) 坐标映射符号** — 在 `_control_loop` 里（`Robot_X←-Vive_Z`、`Robot_Y←-Vive_X`、`Robot_Z←+Vive_Y`）。按 `w` 后手推 tracker 观察：
@@ -201,8 +209,8 @@ python scripts/collect_data.py --task-name pick_cube --fps 30 --teaching
 | 数据集 | 形状 | 含义 |
 |--------|------|------|
 | `observations/qpos` | (N, 7) | 6 关节角 + 夹爪归一化(0~1, 1=张开) |
-| `observations/images/cam_high` | (N, H, W, 3) | 顶部 D435 图像 |
-| `observations/images/cam_wrist` | (N, H, W, 3) | 腕部 Orbbec 图像 |
+| `observations/images/camera_global` | (N, H, W, 3) | 顶部 D435 图像 |
+| `observations/images/camera_left` | (N, H, W, 3) | 腕部 Orbbec 图像 |
 | `action` | (N, 7) | 行为克隆标签 = 下一帧 qpos |
 | `timestamps` | (N,) | 相对时间戳(秒) |
 
@@ -259,7 +267,7 @@ python scripts/convert_to_lerobot.py \
 
 | 现象 | 排查 |
 |------|------|
-| `Vive: FAIL` | SteamVR 没开 / tracker 未追踪；多 tracker 用 `--tracker-serial` 指定 |
+| `Vive: FAIL` | SteamVR 没开 / tracker 未追踪 / 基站没通电；无头显报 `Init_HmdNotFound` → 需配 null 假头显（见 [硬件配置 README](../hardware/README.md)）；多 tracker 用 `--tracker-serial` 指定 |
 | 按 `w` 机械臂乱跳 | `ROBOT_INIT_POS/ORI` 没标定（见 3.2） |
 | 机械臂方向反了 | 坐标映射符号需翻转（见 3.2b） |
 | `import pyorbbecsdk` 报 undefined symbol | 没 `source env.sh`（库路径未修） |

@@ -30,11 +30,14 @@ arm.rm_set_arm_run_mode(1)     # 设置运行模式
 
 ### 只读自检（不下发任何运动）
 ```bash
-python hardware/realman_arm.py                 # 分层: IP冲突 / TCP / SDK状态 / 机型固件
-python hardware/realman_arm.py --scan --all    # 同网段多台 RM65 时列候选并逐台读状态
+python hardware/realman_arm.py                       # 分层: IP冲突 / TCP / SDK状态 / 机型固件
+python hardware/realman_arm.py --scan --all          # 同网段多台 RM65 时列候选并逐台读状态
+python hardware/realman_arm.py --read-init           # 读当前笛卡尔位姿→打印 ROBOT_INIT 粘贴行
+python hardware/realman_arm.py --read-init --write   # 同上并直接写入 collect_data.py 的 ROBOT_INIT_POS/ORI
 ```
 > 同网段可能有多台同型号 RM65（SN 读不出、型号固件相同），靠**关节角与物理停放姿态肉眼比对**锁定本项目这台（当前 `.123`）。
 > 若报 “IP 冲突: 目标 IP 是本机网卡地址”，说明本机网卡 IP 与臂 IP 撞车（ping 通是 ping 自己），用 `--scan` 重新定位。
+> `--read-init`：标定遥操起始位姿——手动把臂拖到起始位后运行读取当前笛卡尔位姿；加 `--write` 直接写入 `collect_data.py` 的 `ROBOT_INIT_POS/ORI`（只改文本、不下发运动）。完整流程见 [数据采集指南 3.2](../docs/data_collection.md)。
 
 ---
 
@@ -166,17 +169,36 @@ python -c "import pyrealsense2 as rs, time; \
 ### 前置要求
 1. 安装 [SteamVR](https://store.steampowered.com/app/250820/SteamVR/)
 2. 安装 OpenVR Python: `pip install openvr`
-3. 配对 Vive Tracker
+3. **基站（Lighthouse Base Station）通电**、Vive Tracker 开机并配对（Tracker 靠基站定位，无基站拿不到 6DOF 位姿）
+4. **只有 Tracker、没有头显**时须先配置 null 假头显（见下方「无头显运行」），否则 `openvr.init` 报 `Init_HmdNotFound`
 
 ### SteamVR 启停
+> ⚠️ 旧命令 `~/.steam/debian-installation/ubuntu12_64/steam-runtime/run.sh ... SteamVR/bin/vrserver` 已失效：本机无 `debian-installation` 布局、vrserver 实际在 `bin/linux64/`；且**裸跑 vrserver 会因无 vrmonitor 在约 20 秒后自动退出**（日志 `Monitor: 0`）。必须启动完整 SteamVR 栈。
+
 ```bash
-# 启动
-~/.steam/debian-installation/ubuntu12_64/steam-runtime/run.sh \
-    ~/.local/share/Steam/steamapps/common/SteamVR/bin/vrserver &
+# 启动完整 SteamVR 栈（vrserver + vrmonitor，推荐；等价于库里点「启动」）
+steam steam://rungameid/250820
 
 # 停止
 pkill -f vrserver
 ```
+
+### 无头显运行（只有 Tracker、没有头显时必做）
+没有 HMD 时 SteamVR 默认拒绝初始化。启用自带的 **null 假头显驱动**即可：编辑
+`~/.local/share/Steam/steamapps/common/SteamVR/resources/settings/default.vrsettings`，
+在 `"steamvr"` 段设置/新增以下三项：
+```json
+"requireHmd": false,
+"forcedDriver": "null",
+"activateMultipleDrivers": true
+```
+并在**文件顶层**新增（null 驱动默认禁用，不加这段 `forcedDriver` 会被日志 `Ignoring ... driver is disabled` 忽略）：
+```json
+"driver_null": { "enable": true }
+```
+改完重启 SteamVR 生效。之后 `python hardware/vive_tracker.py` 应能枚举出 `hmd: Null`、`tracker`、`tracking_reference`(基站) 并实时输出位姿。
+
+> ⚠️ **SteamVR 更新会覆盖 `default.vrsettings`**，更新后需重配（改前先备份该文件）。
 
 ### 坐标映射
 Vive Tracker 坐标系与机械臂坐标系不一致，需要映射：
@@ -188,7 +210,8 @@ Vive → Robot:
 ```
 
 ### 校准流程
-1. 将 Tracker 放在固定位置
+0. **首次/换硬件**：手动把臂拖到遥操起始位 → `python hardware/realman_arm.py --read-init --write` 写入 `ROBOT_INIT_POS/ORI`（tracker 零点对应的机械臂位姿）
+1. 将 Tracker 放到对应上一步起始位的固定姿态
 2. 按 `v` 校准（记录零点）
 3. 按 `w` 启用遥控
 4. 移动 Tracker 控制机械臂

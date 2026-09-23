@@ -112,7 +112,7 @@ data/pick_cube_30fps/
 ├── data/
 │   └── train-*.parquet    # 状态/动作表格数据
 └── videos/
-    └── observation.images.cam_high/
+    └── observation.images.camera_global/
         └── episode_000000.mp4
 ```
 
