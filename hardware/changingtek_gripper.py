@@ -286,8 +286,13 @@ class ChangingtekGripper:
         except (OSError, ValueError):
             return None
 
-    def _save_calibration(self, result, margin=0.02):
-        """把标定结果按 name 合并写入 JSON (保留其他夹爪条目)。"""
+    def _save_calibration(self, result, margin=0.02, keep_history=True):
+        """把标定结果按 name 合并写入 JSON (保留其他夹爪条目)。
+
+        keep_history=True 时, 覆盖前把上一次的当前标定追加进 entry["history"],
+        使同一夹爪历次标定都留在文件内 (该文件被 .gitignore, 历史仅本地保留)。
+        _load_calibration 只读 min_position/max_position, 多出的 history 键不影响加载。
+        """
         data = {}
         try:
             with open(self.calibration_file, "r", encoding="utf-8") as f:
@@ -301,6 +306,17 @@ class ChangingtekGripper:
             "port": self.port, "slave_id": self.slave_id,
             "margin": margin, "calibrated_at": datetime.now().isoformat(timespec="seconds"),
         })
+        if keep_history:
+            prev = data.get(self.name)
+            history = []
+            if isinstance(prev, dict):
+                # 继承已有历史, 再把上一次的当前值 (剔除 history 键) 追加为一条历史快照
+                history = list(prev.get("history", []))
+                snapshot = {k: v for k, v in prev.items() if k != "history"}
+                if snapshot:
+                    history.append(snapshot)
+            if history:
+                entry["history"] = history
         data[self.name] = entry
         with open(self.calibration_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
