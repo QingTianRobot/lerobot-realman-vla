@@ -20,9 +20,16 @@ ENV/
 *.swo
 *~
 
-# Data & Models (large files)
-data/
-outputs/
+# Data & Models (large files) — 保留目录占位, 忽略其内容
+data/*
+!data/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# 相机自检/调试输出 (仓库根目录, 由 hardware/*_camera.py --save 产生)
+debug_*.png
+orbbec_*.png
+realsense_*.png
 checkpoints/
 *.hdf5
 *.h5
@@ -38,6 +45,16 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+Log/
+
+# 第三方 SDK (体积大且各自带嵌套 .git, 由用户自行 clone 到 vendor/)
+vendor/
+
+# 临时脚本 (自述用完即删, 不纳入版本控制)
+.steam_monitor.sh
+
+# 夹爪行程标定 (机器/硬件相关, 由 changingtek_gripper.py --calibrate 生成)
+hardware/gripper_calibration.json
 
 # Jupyter
 .ipynb_checkpoints/
