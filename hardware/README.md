@@ -172,16 +172,23 @@ python -c "import pyrealsense2 as rs, time; \
 3. **基站（Lighthouse Base Station）通电**、Vive Tracker 开机并配对（Tracker 靠基站定位，无基站拿不到 6DOF 位姿）
 4. **只有 Tracker、没有头显**时须先配置 null 假头显（见下方「无头显运行」），否则 `openvr.init` 报 `Init_HmdNotFound`
 
-### SteamVR 启停
+### SteamVR 启停（推荐用一键脚本）
 > ⚠️ 旧命令 `~/.steam/debian-installation/ubuntu12_64/steam-runtime/run.sh ... SteamVR/bin/vrserver` 已失效：本机无 `debian-installation` 布局、vrserver 实际在 `bin/linux64/`；且**裸跑 vrserver 会因无 vrmonitor 在约 20 秒后自动退出**（日志 `Monitor: 0`）。必须启动完整 SteamVR 栈。
 
+`hardware/steamvr_restart.sh` 已把「清理幽灵树 → 常驻启动完整栈 → 轮询等待就绪」固化成一键流程（需在**宿主机终端**执行，沙箱内看不到宿主机进程）：
+
 ```bash
-# 启动完整 SteamVR 栈（vrserver + vrmonitor，推荐；等价于库里点「启动」）
-steam steam://rungameid/250820
+# 清理残留 + 常驻启动完整栈 (vrserver + vrmonitor)，并等待两者同时就绪后打印确认
+bash hardware/steamvr_restart.sh
+
+# 只清理幽灵进程树，不启动 (上次退出残留导致 game already running 时用)
+bash hardware/steamvr_restart.sh --kill
 
 # 停止
 pkill -f vrserver
 ```
+
+脚本会杀掉整棵 `AppId=250820 / reaper / steam-launch-wrapper / vrstartup / steamvr_room_setup / vrserver / vrmonitor` 幽灵树（避免 `game already running`），再 `steam steam://rungameid/250820`，最后轮询到 `pgrep -x vrserver` 与 `pgrep -x vrmonitor` 同时就绪才返回；若检测到房间设置弹窗会提示跳过。
 
 ### 无头显运行（只有 Tracker、没有头显时必做）
 没有 HMD 时 SteamVR 默认拒绝初始化。启用自带的 **null 假头显驱动**即可：编辑
@@ -199,6 +206,33 @@ pkill -f vrserver
 改完重启 SteamVR 生效。之后 `python hardware/vive_tracker.py` 应能枚举出 `hmd: Null`、`tracker`、`tracking_reference`(基站) 并实时输出位姿。
 
 > ⚠️ **SteamVR 更新会覆盖 `default.vrsettings`**，更新后需重配（改前先备份该文件）。
+
+### 运行自检与正确启动顺序
+
+⚠️ **务必先启动完整 SteamVR 栈，再跑 `vive_tracker.py`**。若直接跑脚本，`openvr.init()` 会自己临时拉起一个 vrserver，而它因无 vrmonitor 会在脚本退出后约 17 秒自杀（vrserver.txt: `Shutting down server ... Monitor: 0`）；下次再跑时 vrserver 冷启动握手需约 15 秒，基站/tracker 追踪尚未就绪，脚本便判定 `No tracker found!` 退出——形成“第一次找得到、退出后就找不到”的恶性循环。
+
+推荐直接用一键脚本（等价于下面 1~3 步，且自带幽灵树清理与就绪轮询）：
+
+```bash
+bash hardware/steamvr_restart.sh   # 清理 + 常驻启动 + 等到 vrserver/vrmonitor 都就绪
+python hardware/vive_tracker.py    # 再跑自检 / collect_data.py
+```
+
+手动流程（脚本不可用时）：
+
+```bash
+# 1. 常驻启动完整栈（vrmonitor 撑着 vrserver，不会自动退出）
+steam steam://rungameid/250820
+
+# 2. 等 10~20 秒，确认两个进程都在
+pgrep -x vrserver && pgrep -x vrmonitor
+
+# 3. 再跑自检；脚本退出（已内置 openvr.shutdown）不影响 SteamVR，可反复运行
+python hardware/vive_tracker.py
+```
+
+> `vive_tracker.py` 已内置：未发现 tracker 时自动等待重试（默认 8 次 × 2s）、退出时 `openvr.shutdown()` 干净释放、位姿刷新 `flush=True`。但这些只在 **vrserver 存活**时有效，替代不了上面的常驻启动。
+> 若 `steam steam://rungameid/250820` 报 `game already running`：上次退出残留了 reaper 幽灵进程，直接 `bash hardware/steamvr_restart.sh`（会先清树再启动）；或手动 `pgrep -af 'AppId=250820|vrstartup|steamvr_room_setup'` 找出后 `kill -9` 再启动。
 
 ### 坐标映射
 Vive Tracker 坐标系与机械臂坐标系不一致，需要映射：

@@ -81,6 +81,8 @@ python hardware/vive_tracker.py   # 打印发现的设备(hmd/tracker/基站)与
 采集脚本启动时会打印 `Vive: OK/FAIL`，`FAIL` 说明 SteamVR 没开或 tracker 没被追踪到。
 
 > **无头显**（只有 Tracker）时，SteamVR 默认要求 HMD，`vive_tracker.py` 会报 `Init_HmdNotFound`；需配置 null 假头显驱动后才能无头显追踪，详见 [硬件配置 README 的「无头显运行」](../hardware/README.md)。
+>
+> **先启动 SteamVR 再跑脚本**：若直接跑 `vive_tracker.py`，`openvr.init` 会自己临时拉起 vrserver，脚本一退它就因 `Monitor: 0` 自杀，下次再跑冷启动来不及就绪而报 `No tracker found`（“第一次找得到、退出后找不到”）。正确顺序见 README「运行自检与正确启动顺序」。
 
 ---
 
@@ -129,6 +131,8 @@ ROBOT_INIT_ORI = np.array([3.152, 0.149, -0.137])
 
 ## 4. 启动采集
 
+> ⚠️ **采集前务必先常驻启动 SteamVR**：`steam steam://rungameid/250820`，再用 `pgrep -x vrserver && pgrep -x vrmonitor` 确认两个进程都在。采集是长任务，若靠脚本自己临时拉起 vrserver，它无 vrmonitor 撑着会在异常/退出时 `Monitor: 0` 自杀，`_control_loop` 随即读不到位姿（`pose is None` 静默 `continue`）——**机械臂中途不跟随了却仍在录制，采到废数据**。详见 [硬件配置 README「运行自检与正确启动顺序」](../hardware/README.md)。
+
 默认参数已填好你的硬件，最简形式：
 
 ```bash
@@ -142,7 +146,7 @@ python scripts/collect_data.py \
     --arm-ip 192.168.5.123 \
     --gripper-port /dev/realman/gripper_left --gripper-slave-id 2 \
     --cam-top 262322074840 --cam-wrist CV2T66100096 \
-    --tracker-serial LHR-XXXXXXXX \
+    --tracker-serial LHR-B909D55F \
     --save-dir data/raw_hdf5 --task-name pick_cube --fps 30
 ```
 
