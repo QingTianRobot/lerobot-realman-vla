@@ -1,0 +1,9 @@
+# uv 配置：默认使用阿里云 PyPI 镜像（不使用清华）
+# 对本仓库下的 uv 命令自动生效，例如:
+#   uv venv --python 3.10 .venv
+#   uv pip install -r requirements.txt
+#   uv pip install --no-deps pyorbbecsdk2==2.1.2
+
+[[index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true

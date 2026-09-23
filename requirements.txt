@@ -1,29 +1,56 @@
-# Core Framework
-# Install LeRobot first: pip install lerobot
-# See: https://github.com/huggingface/lerobot
+# ============================================================
+# LeRobot-RealMan-VLA 依赖 (Python 3.10)
+# 推荐用 uv 安装: uv venv --python 3.10 .venv && uv pip install -r requirements.txt
+# ============================================================
 
-# Hardware Drivers
-pyrealsense2>=2.55.1          # Intel RealSense SDK
-openvr>=1.26.701              # SteamVR / Vive Tracker
+# ---- 核心框架 (务必 pin 版本) ----
+# 代码强绑定 lerobot 0.4.x 的新 API:
+#   - lerobot.processor.pipeline.DataProcessorPipeline (预/后处理管线)
+#   - lerobot.policies.pi05 (PI0.5)
+#   - LeRobot v3.0 数据集格式, 入口 lerobot.scripts.lerobot_train
+# 升到 0.5.x / 0.6.x 会使 inference.py / convert_to_lerobot.py 报错, 不要改这里的版本。
+# lerobot 会自动拉取匹配的 torch 2.7.1 / torchvision 0.23.x / numpy 2.2.x。
+lerobot==0.4.3
 
-# Data Processing
-h5py>=3.10.0                  # HDF5 read/write
-numpy>=1.24.0                 # Numerical computing
-opencv-python>=4.8.0          # Image processing
-Pillow>=10.0.0                # Image format conversion
+# ---- 硬件驱动 ----
+robotic-arm==1.1.6           # 睿尔曼 RM_API2 (import Robotic_Arm), 机械臂通信
+pyrealsense2>=2.55.1         # 顶部相机 Intel RealSense D435
+openvr>=1.26.701             # SteamVR / Vive Tracker 遥操作
+minimalmodbus>=2.0           # 知行 RTU 夹爪 Modbus (vendor/changingtek_rtu_sdk)
+pyserial>=3.5                # 串口通信 (夹爪)
 
-# Deep Learning (CUDA 11.8+ recommended)
-torch>=2.1.0                  # PyTorch
-torchvision>=0.16.0           # Vision utilities
+# ⚠️ 腕部相机 奥比中光 Gemini 305 (import pyorbbecsdk) 需单独用 --no-deps 安装:
+#   pyorbbecsdk2 声明 av==12.3.0 / numpy<2.0 / open3d / pygame 等, 会与 lerobot 冲突;
+#   但相机取流核心 (编译好的 .so) 并不 import 这些 (它们只服务于其自带示例)。
+#   故在装完本文件后, 再单独执行:
+#     uv pip install --no-deps pyorbbecsdk2==2.1.2
+#
+# ⚠️ Orbbec 库路径坑:
+#   pyorbbecsdk 的 .so 可能把 libOrbbecSDK.so.2 解析到 ROS 旧库, 报
+#   `undefined symbol: ob_application_config_set_struct`。运行前需让自带库优先:
+#     export LD_LIBRARY_PATH=$(python -c "import pyorbbecsdk,os;print(os.path.dirname(pyorbbecsdk.__file__))"):$LD_LIBRARY_PATH
+#   (source env.sh 会自动激活 .venv 并设置好该路径)
 
-# Robotics SDK
-# RealMan RM_API2: Download from https://www.realman-robotics.cn/
-# Install: pip install Robotic_Arm-***.whl
+# ---- 数据处理 ----
+h5py>=3.10.0                 # HDF5 读写
+numpy>=1.24.0                # 数值计算 (实际由 lerobot pin 到 2.2.x)
+opencv-python>=4.8.0         # 图像处理
+Pillow>=10.0.0               # 图像格式转换
 
-# Math / Transforms
-tf-transformations>=1.13.0    # Quaternion/Euler transforms
-scipy>=1.11.0                 # Scientific computing
+# ---- 数学 / 变换 ----
+# 四元数/欧拉角变换 (Vive Tracker 位姿)。注意: `tf-transformations` 仅由 ROS 提供,
+# PyPI 上不存在; 这里用 Gohlke 原版 `transformations` (API 相同, 提供 euler_from_matrix),
+# vive_tracker.py 已做 tf_transformations → transformations 导入回退。
+# 2025.1.1 是支持 Python 3.10 的最新版 (更高版要求 >=3.11)。
+transformations==2025.1.1
+scipy>=1.11.0                # 科学计算
 
-# Optional: VLA models
-# transformers>=4.40.0        # HuggingFace Transformers (for Pi0/SmolVLA)
-# accelerate>=0.27.0          # Training acceleration
+# ---- 深度学习 ----
+# torch / torchvision 由 lerobot 决定版本 (2.7.1 / 0.23.x), 无需在此显式指定,
+# 以免解析器拉到与 lerobot 不兼容的更高版本。
+# PyPI 默认 torch wheel 已内置 CUDA 12.x 运行库, 匹配本机驱动即可, 无需额外 index。
+
+# ---- 可选: VLA 模型 (SmolVLA / Pi0) ----
+# transformers / accelerate 已由 lerobot 拉入; 如需固定可自行取消注释:
+# transformers>=4.40.0
+# accelerate>=0.27.0
