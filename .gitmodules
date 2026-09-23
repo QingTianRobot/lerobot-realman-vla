@@ -1,0 +1,3 @@
+[submodule "vendor/changingtek_rtu_sdk"]
+	path = vendor/changingtek_rtu_sdk
+	url = https://github.com/QingTianRobot/changingtek_rtu_sdk.git

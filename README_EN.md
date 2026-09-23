@@ -46,9 +46,10 @@ This project implements a complete imitation learning pipeline for the **RealMan
 ## Quick Start
 
 ```bash
-# Clone and setup
-git clone https://github.com/Humble2Full/lerobot-realman-vla.git
+# Clone and setup (--recursive fetches the gripper SDK submodule vendor/changingtek_rtu_sdk)
+git clone --recursive https://github.com/Humble2Full/lerobot-realman-vla.git
 cd lerobot-realman-vla
+# If already cloned without it: git submodule update --init --recursive
 bash setup.sh
 
 # Collect data

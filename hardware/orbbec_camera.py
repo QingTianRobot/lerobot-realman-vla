@@ -13,7 +13,7 @@
 ⚠️ 库冲突坑：pyorbbecsdk 的 .so 可能把 libOrbbecSDK.so.2 解析到 ROS 的旧库，
    导致 `undefined symbol: ob_application_config_set_struct`。运行前需让自带库优先:
      export LD_LIBRARY_PATH=$(python -c "import pyorbbecsdk,os;print(os.path.dirname(pyorbbecsdk.__file__))"):$LD_LIBRARY_PATH
-   （若已装 vendor/OrbbecSDK_v2 的 2.9.3 库，也可指向其 install/lib）
+   （该库由 pip 的 pyorbbecsdk2 提供，source env.sh 会自动前置此路径）
 
 自检:
   python hardware/orbbec_camera.py [--serial CV2T66100096]

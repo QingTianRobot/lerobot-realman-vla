@@ -47,8 +47,11 @@ Thumbs.db
 wandb/
 Log/
 
-# 第三方 SDK (体积大且各自带嵌套 .git, 由用户自行 clone 到 vendor/)
-vendor/
+# 第三方 SDK
+# changingtek_rtu_sdk 已作为 git submodule 锁定 commit 纳管;
+# vendor 下其余内容(体积大/自带嵌套 .git)仍由用户自行 clone, 不进版本控制
+vendor/*
+!vendor/changingtek_rtu_sdk
 
 # 临时脚本 (自述用完即删, 不纳入版本控制)
 .steam_monitor.sh
