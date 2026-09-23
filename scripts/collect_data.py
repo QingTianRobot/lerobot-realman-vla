@@ -331,7 +331,7 @@ class ViveController:
                 R_cur = _quat_to_matrix(np.array([pose[3], pose[4], pose[5], pose[6]]))
 
                 scale_pos = 1   # 位置灵敏度: 调大=机械臂动得比手多, 调小=更细腻
-                scale_ori = 1   # 姿态灵敏度: 作用于相对旋转的转角 (原 0.3 太小, 转 30° 末端只转 9°)
+                scale_ori = 1.4   # 姿态灵敏度: 作用于相对旋转的转角 (原 0.3 太小, 转 30° 末端只转 9°)
 
                 # ================= 坐标映射: Vive → Robot（旋转矩阵法, 现场标定改外参）=================
                 # 固定外参 VIVE_TO_ROBOT_RPY_DEG={90,0,-90} 给出换基矩阵 M, 位置/姿态共用:
