@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""
+睿尔曼 RealMan RM65 机械臂只读自检
+
+只做"连接 + 读状态 / 读信息"，**不下发任何运动、使能、运行模式指令**，
+可安全地在采集/推理前反复运行，用于确认机械臂是否在线、健康。
+
+分层检查:
+  1. IP 冲突: 目标 IP 是否就是本机网卡地址 (是则 ping 通但 TCP 必拒绝)
+  2. TCP:     目标 ip:port 是否可连接 (RM 服务在监听)
+  3. SDK:     rm_create_robot_arm 句柄有效 + rm_get_current_arm_state code==0
+  4. 信息:    rm_get_robot_info / rm_get_arm_software_info (型号/固件)
+
+⚠️ 同网段可能有多台同型号 RM65 (SN 读不出、型号固件相同), 无法靠 SN 区分;
+   用 --scan 列出所有开 8080 的候选, 再结合关节角与物理停放姿态肉眼比对锁定。
+
+依赖:
+  pip install robotic-arm   (RM_API2, 提供 Robotic_Arm.rm_robot_interface)
+
+自检:
+  python hardware/realman_arm.py [--arm-ip 192.168.5.123] [--arm-port 8080]
+  python hardware/realman_arm.py --scan          # 扫网段列出候选机械臂
+  python hardware/realman_arm.py --scan --all    # 扫描并逐台读状态
+"""
+
+import socket
+import subprocess
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+
+DEFAULT_ARM_IP = "192.168.5.123"
+DEFAULT_ARM_PORT = 8080
+DEFAULT_SUBNET = "192.168.5"
+
+
+def local_ips():
+    """本机所有 IPv4 地址 (用于 IP 冲突自检)。"""
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True,
+                             text=True, timeout=5)
+        if out.stdout.split():
+            return set(out.stdout.split())
+    except Exception:
+        pass
+    try:
+        return set(socket.gethostbyname_ex(socket.gethostname())[2])
+    except Exception:
+        return set()
+
+
+def check_tcp(ip, port, timeout=2.0):
+    """目标 ip:port 是否可 TCP 连接 (RM 服务在监听)。"""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def probe_subnet(subnet=DEFAULT_SUBNET, port=DEFAULT_ARM_PORT, workers=64):
+    """并发探测整个 /24 网段, 返回 port 开放的主机 IP 列表 (跳过本机)。"""
+    mine = local_ips()
+    cands = [f"{subnet}.{i}" for i in range(1, 255) if f"{subnet}.{i}" not in mine]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        flags = list(ex.map(lambda a: check_tcp(a, port, 1.0), cands))
+    hits = [ip for ip, ok in zip(cands, flags) if ok]
+    return sorted(hits, key=lambda s: int(s.rsplit(".", 1)[1]))
+
+
+def read_arm(ip, port=DEFAULT_ARM_PORT):
+    """只读连接机械臂并读取状态/机型/固件。返回 dict; 不产生任何运动。"""
+    from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
+    res = {"ip": ip, "connect": False, "state_code": None,
+           "joint": None, "model": None, "product": None}
+    arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
+    try:
+        handle = arm.rm_create_robot_arm(ip, port)
+        if handle.id == -1:
+            return res
+        res["connect"] = True
+
+        code, state = arm.rm_get_current_arm_state()
+        res["state_code"] = code
+        if code == 0:
+            res["joint"] = [round(float(x), 3) for x in state.get("joint", [])]
+        try:
+            _, info = arm.rm_get_robot_info()
+            res["model"] = info.get("arm_model")
+        except Exception:
+            pass
+        try:
+            _, sw = arm.rm_get_arm_software_info()
+            res["product"] = sw.get("product_version")
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001 - 自检需吞掉 SDK 异常并汇报
+        res["error"] = str(e)
+    finally:
+        try:
+            arm.rm_delete_robot_arm()
+        except Exception:
+            pass
+    return res
+
+
+def self_test(ip, port):
+    """对单台机械臂做分层只读自检, 返回是否健康。"""
+    healthy = True
+    print("=" * 50)
+    print(f"  RealMan RM65 只读自检  target={ip}:{port}")
+    print("=" * 50)
+
+    # 1. IP 冲突
+    if ip in local_ips():
+        print(f"[!] IP 冲突: {ip} 是本机网卡地址 —— ping 会通(在 ping 自己)但 TCP 必拒绝。"
+              f"请用 --scan 定位真实机械臂。")
+        healthy = False
+
+    # 2. TCP
+    tcp_ok = check_tcp(ip, port)
+    print(f"[{'✓' if tcp_ok else '!'}] TCP {ip}:{port} : "
+          f"{'开放' if tcp_ok else '拒绝/不可达'}")
+    if not tcp_ok:
+        print(f"[i] 提示: 用 --scan 扫网段找开 {port} 的候选机械臂。")
+        return False
+
+    # 3-4. SDK 连接 + 状态 + 信息
+    r = read_arm(ip, port)
+    if not r["connect"]:
+        print(f"[!] SDK 连接失败 (handle=-1){': ' + r.get('error','') if r.get('error') else ''}")
+        return False
+    print("[✓] SDK 连接 OK")
+
+    if r["state_code"] == 0:
+        print(f"[✓] 状态 code=0  关节角(°)={r['joint']}")
+    else:
+        print(f"[!] 读状态异常 code={r['state_code']}")
+        healthy = False
+
+    print(f"[i] 型号={r['model']}  产品/固件={r['product']}")
+    print("-" * 50)
+    print("结论: 机械臂正常 (只读自检通过)" if healthy else "结论: 机械臂异常, 见上方 [!] 项")
+    return healthy
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="睿尔曼 RM65 机械臂只读自检 (不下发运动)")
+    parser.add_argument("--arm-ip", type=str, default=DEFAULT_ARM_IP)
+    parser.add_argument("--arm-port", type=int, default=DEFAULT_ARM_PORT)
+    parser.add_argument("--subnet", type=str, default=DEFAULT_SUBNET,
+                        help="--scan 时扫描的 /24 网段前缀")
+    parser.add_argument("--scan", action="store_true",
+                        help="扫网段列出所有开放机械臂端口的主机")
+    parser.add_argument("--all", action="store_true",
+                        help="配合 --scan: 对每台候选逐台读状态")
+    args = parser.parse_args()
+
+    if args.scan:
+        hits = probe_subnet(args.subnet, args.arm_port)
+        print(f"网段 {args.subnet}.0/24 开放 {args.arm_port} 的主机: {hits or '无'}")
+        if args.all:
+            for ip in hits:
+                r = read_arm(ip, args.arm_port)
+                print(f"  {ip}: connect={r['connect']} state_code={r['state_code']} "
+                      f"joint={r['joint']} model={r['model']} product={r['product']}")
+        raise SystemExit(0)
+
+    raise SystemExit(0 if self_test(args.arm_ip, args.arm_port) else 1)

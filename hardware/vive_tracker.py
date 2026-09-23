@@ -6,7 +6,7 @@ Vive Tracker OpenVR 接口
 支持多个 Tracker 同时连接，通过序列号区分。
 
 依赖:
-  pip install openvr tf-transformations
+  pip install openvr transformations
 
 参考: https://github.com/TriadSemi/triad_openvr
 """
@@ -18,10 +18,14 @@ import math
 import numpy as np
 
 try:
-    from tf_transformations import euler_from_matrix
+    from tf_transformations import euler_from_matrix  # ROS 提供 (tf-transformations)
 except ImportError:
-    print("需要安装: pip install tf-transformations")
-    raise
+    try:
+        # PyPI 上的 Gohlke 原版, API 与 tf_transformations 相同 (提供 euler_from_matrix)
+        from transformations import euler_from_matrix
+    except ImportError:
+        print("需要安装: pip install transformations  (或 ROS 的 tf-transformations)")
+        raise
 
 
 def convert_to_euler(pose_mat):

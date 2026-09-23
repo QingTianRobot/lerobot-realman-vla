@@ -4,7 +4,7 @@
 
 ### 连接配置
 - **通信协议**: TCP/IP
-- **默认IP**: `192.168.2.18`（出厂值，可通过示教器修改）
+- **默认IP**: `192.168.5.123`（本项目当前机械臂；出厂默认 `192.168.2.18`，可通过示教器修改）
 - **默认端口**: `8080`
 - **SDK**: [RM_API2 Python](https://www.realman-robotics.cn/)
 
@@ -13,12 +13,11 @@
 from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 
 arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-handle = arm.rm_create_robot_arm("<YOUR_ARM_IP>", 8080)
+handle = arm.rm_create_robot_arm("192.168.5.123", 8080)
 
 # 基础设置
 arm.rm_set_arm_run_mode(1)     # 设置运行模式
-arm.rm_set_tool_voltage(3)     # 工具端电压 3V
-arm.rm_set_modbus_mode(1, 9600, 2)  # Modbus: 端口1, 9600波特率
+# 夹爪已改为知行 RTU 独立串口，无需工具端供电 / Modbus 透传设置
 ```
 
 ### 运动控制
@@ -29,86 +28,140 @@ arm.rm_set_modbus_mode(1, 9600, 2)  # Modbus: 端口1, 9600波特率
 | `rm_movep_canfd(pose, False, 0, 60)` | 笛卡尔空间CANFD | 非阻塞 |
 | `rm_get_current_arm_state()` | 获取当前状态 | - |
 
+### 只读自检（不下发任何运动）
+```bash
+python hardware/realman_arm.py                 # 分层: IP冲突 / TCP / SDK状态 / 机型固件
+python hardware/realman_arm.py --scan --all    # 同网段多台 RM65 时列候选并逐台读状态
+```
+> 同网段可能有多台同型号 RM65（SN 读不出、型号固件相同），靠**关节角与物理停放姿态肉眼比对**锁定本项目这台（当前 `.123`）。
+> 若报 “IP 冲突: 目标 IP 是本机网卡地址”，说明本机网卡 IP 与臂 IP 撞车（ping 通是 ping 自己），用 `--scan` 重新定位。
+
 ---
 
-## 夹爪 — FAE2M86C (Modbus RTU)
+## 夹爪 — 知行 RTU 平动手 (Modbus RTU / 独立串口)
 
-### Modbus 参数
+夹爪通过**独立 RS-485 串口**直接控制，与机械臂**完全解耦**——不再经机械臂 Modbus 透传，
+也无需工具端供电设置。驱动见 `vendor/changingtek_rtu_sdk`，封装见 `hardware/changingtek_gripper.py`。
+
+### 连接配置
 | 参数 | 值 |
 |------|---|
-| 端口 (port) | 1 |
-| 寄存器地址 (address) | 43 |
-| 设备号 (device) | 1 |
-| 寄存器数量 (num) | 2 |
-| 波特率 | 9600 |
-| 停止位 | 2 |
+| 串口 | `/dev/realman/gripper_left` (udev 软链 → ttyUSB2) |
+| 从站地址 slave_id | `2` |
+| 波特率 | 115200 |
+| 行程 | `min_position`(小端、mm≈0、**物理张开**) ~ `max_position`(大端、mm≈86、**物理闭合**)，设备单位 /100 = mm |
 
-### 编码方式
-夹爪位置通过 4 字节寄存器值编码：
+### 归一化约定
+第 7 维（qpos/action 的最后一维）统一归一化到 `0~1`（**对外语义**）：
+```
+v = 1.0 -> 张开
+v = 0.0 -> 闭合
+推理端沿用 “>0.5 判为开” 的阈值
+```
+⚠ 本机知行平动手的**物理行程方向与归一化约定相反**（小端=张开、大端=闭合），
+封装默认 `invert=True` 已在归一化↔物理位置间反转映射：`v=0` 驱动到大端(物理闭合)、`v=1` 到小端(物理张开)。
+若实测张开/闭合到位值不同，改 `ChangingtekGripper(min_position=..., max_position=...)`；若换用方向一致的夹爪，置 `invert=False`。
+
+### 接口
 ```python
-def dec_to_register(dec):
-    """小数 (0=全开, 1=全闭) → 4字节寄存器"""
-    value = dec * 256000
-    R0 = int(value // (256**3))
-    R1 = int((value % (256**3)) // (256**2))
-    R2 = int((value % (256**2)) // 256)
-    R3 = int(value % 256)
-    return [R0, R1, R2, R3]
-
-# 全开: [0, 0, 0, 0]
-# 全闭: [0, 3, 232, 0]
+from changingtek_gripper import ChangingtekGripper
+g = ChangingtekGripper(port="/dev/realman/gripper_left", slave_id=2)
+g.connect()                 # 连接 + 启动后台轮询线程 + 使能
+g.open(); g.close()         # 张开 / 闭合
+g.move_pct(60)              # 按百分比 (0~100)
+print(g.get_position_normalized())  # 读归一化位置 (后台线程已缓存)
+g.disable(); g.disconnect()
 ```
 
-### ⚠️ Modbus 超时陷阱
-
-Modbus 读写单次可能耗时 **300-500ms**（9600 波特率下的超时机制），同步执行会将主控制循环频率从 30Hz 拖到 1-2Hz。
-
-> 容易误判为模型推理瓶颈。加 timing 日志可快速定位。
-
-**解决方案**：异步写入 + 缓存读取
-```python
-# ❌ 同步阻塞（不要这样做）
-gripper_pos = arm.rm_read_multiple_holding_registers(params)  # 可能500ms
-
-# ✅ 异步写入 + 缓存状态
-threading.Thread(target=write_gripper, daemon=True).start()
-# 夹爪只有开/闭两种状态，不需要实时读取
-```
+### 性能说明
+夹爪走独立串口，`request_move` 由所属总线的后台线程串行异步下发，**不阻塞主控制循环**；
+反馈按 `poll_hz`(默认 25Hz) 缓存，读取零阻塞。自检：`python hardware/changingtek_gripper.py`。
 
 ---
 
-## 相机 — Intel RealSense D435i
+## 相机 — 顶部 D435 (RealSense) + 腕部 Gemini 305 (Orbbec)
 
 ### 双相机配置
-| 位置 | 序列号 | 用途 |
-|------|--------|------|
-| 顶部 | `<YOUR_TOP_CAM_SN>` | 全局视角 |
-| 腕部 | `<YOUR_WRIST_CAM_SN>` | 精细视角 |
+| 位置 | 型号 | 驱动 | 序列号 | 用途 |
+|------|------|------|--------|------|
+| 顶部 | Intel RealSense D435 | `pyrealsense2` | `262322074840` | 全局视角 |
+| 腕部 | 奥比中光 Gemini 305 | `pyorbbecsdk` | `CV2T66100096` | 精细视角 |
+
+两个相机类接口一致（`get_frame()` 返回 BGR `(H,W,3)`、`is_active`、`close()`），采集/推理脚本可无缝替换。
 
 ### 推荐参数
 | 参数 | 值 | 说明 |
 |------|---|------|
 | 分辨率 | 640×480 | 平衡质量与速度 |
 | 帧率 | 30fps | 与采集频率对齐 |
-| 自动曝光 | **关闭** | 自动曝光会导致训练/推理图像不一致 |
-| 手动曝光 | 150 | 根据环境光调整，室内日光灯环境参考值 |
+| 自动曝光 | **关闭** (D435) | 自动曝光会导致训练/推理图像不一致 |
 
-### 相机占用问题
-
-如果出现 "Device is already in use"——通常是上次脚本没正常退出，RealSense 设备锁没释放：
+### ⚠️ Orbbec 库冲突（必读）
+`pyorbbecsdk` 的 `.so` 可能把 `libOrbbecSDK.so.2` 解析到 ROS 的旧库
+(`/opt/ros/humble/lib`)，导致 `undefined symbol: ob_application_config_set_struct`。
+运行任何用到腕部相机的脚本前，让自带 2.9.3 库优先：
 ```bash
-# 找到并杀掉占用进程
-pkill -f realsense
-pkill -f collect_data
+export LD_LIBRARY_PATH=$(python -c "import pyorbbecsdk,os;print(os.path.dirname(pyorbbecsdk.__file__))"):$LD_LIBRARY_PATH
+python -c "import pyorbbecsdk; print('ok')"   # 验证
+```
+> 运行采集/推理的终端不要先 source ROS humble，或确保上面的路径排在 `LD_LIBRARY_PATH` 最前。
+> 腕部相机自检：`python hardware/orbbec_camera.py --serial CV2T66100096`。
 
-# 实在不行就物理拔插 USB
+### RealSense 自检
+
+顶部 D435 独立自检（与夹爪、腕部相机自检命令同风格）：
+```bash
+python hardware/realsense_camera.py --serial 262322074840
 ```
 
-另外两个相机**不要接同一个 USB 控制器**，带宽不够也会报这个错。
+自检流程：
+1. **硬件复位**：`RealSenseCamera.__init__` 会先遍历 `rs.context().query_devices()` 找到目标序列号，
+   调用 `dev.hardware_reset()` 并等待 2s，释放上次未正常退出的设备锁
+2. **建流**：640×480@30fps，`rs.format.bgr8`（省去 RGB→BGR 转换）
+3. **固定曝光**：关闭 `enable_auto_exposure`，`exposure=150`，避免亮度波动污染训练
+4. **抓帧验证**：等待 1s 后取一帧，检查 `shape=(480,640,3) dtype=uint8 nonzero=True`
+5. **FPS 压测**：连续 30 帧，期望更新数 ≥29、实际 FPS ≈29.7
+6. **落盘**：测试帧保存到 `outputs/realsense_test_frame.png` 供肉眼确认（不使用 Qt/GUI）
+
+### RealSense USB 断联 / 设备占用排查
+
+**症状 A**：`RuntimeError: Device is already in use` / `failed to set power state`
+通常是上次脚本 Ctrl-C 或崩溃，RealSense 内核态句柄未释放。
+
+```bash
+# 1. 找到并杀掉占用进程
+pkill -f realsense
+pkill -f collect_data
+pkill -f inference
+
+# 2. 若仍失败, 触发一次 hardware_reset (自检脚本已内置, 也可手动):
+python -c "import pyrealsense2 as rs, time; \
+    [d.hardware_reset() for d in rs.context().query_devices() \
+     if d.get_info(rs.camera_info.serial_number)=='262322074840']; time.sleep(2)"
+
+# 3. 实在不行就物理拔插 USB
+```
+
+**症状 B**：`No device connected` / `lsusb` 看不到 `8086:0b07`
+- 检查 USB 线是否是**数据线**（很多 Type-C 线只供电不通数据）
+- 换到主板后置 **USB 3.0** 端口（D435 需要 USB 3 带宽；USB 2.0 下 640×480@30fps 也会掉帧）
+- `dmesg -w` 观察插拔时是否有枚举日志
+
+**症状 C**：两个相机同时启动时报带宽不足 / 帧率骤降
+- 顶部 D435 和腕部 Gemini 305 **不要接同一个 USB 控制器**
+- `lsusb -t` 查看 USB 树，把两台相机分到不同 root hub
+
+**硬件复位说明**：`hardware_reset()` 会让设备重新枚举一次 USB（约 2s），
+等价于软拔插，无需 physically 动手。自检脚本每次启动都会主动复位，
+因此**连续两次运行自检之间要留 ≥3s 间隔**，否则第二次可能在设备尚未 ready 时失败。
 
 ---
 
-## 遥操作 — HTC Vive Tracker 3.0
+## 遥操作 — Vive Tracker (OpenVR)
+
+> 本项目使用 **Pika Sense viva tracker**，它与 HTC Vive Tracker 同为 SteamVR/OpenVR 的
+> `GenericTracker`，`hardware/vive_tracker.py` 按设备类自动发现，**无需改代码**；
+> 实物安装不同时仅需重标定零点常量 `ROBOT_INIT_POS/ORI` 与坐标映射符号。
 
 ### 前置要求
 1. 安装 [SteamVR](https://store.steampowered.com/app/250820/SteamVR/)
