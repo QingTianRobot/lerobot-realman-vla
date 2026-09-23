@@ -158,9 +158,12 @@ def main():
         if (ep_idx + 1) % 10 == 0 or ep_idx == len(hdf5_files) - 1:
             print(f"  已完成 {ep_idx + 1}/{len(hdf5_files)} episodes ({total_frames} frames)")
 
-    # 整合数据集（视频编码 + 统计量计算）
-    print("\n正在整合数据集（编码视频）...")
-    dataset.consolidate()
+    # 收尾：LeRobot 0.4.x 中视频在 save_episode() 时已即时编码，
+    # 这里 finalize() 负责关闭 parquet writer 并写 footer 元数据；
+    # 不调用则数据集无效、无法被 LeRobotDataset 加载。
+    # (0.3.x 的 consolidate() 在 0.4.x 已移除)
+    print("\n正在收尾数据集（写入 parquet 元数据）...")
+    dataset.finalize()
 
     print(f"\n{'=' * 50}")
     print(f"✓ 数据集转换完成!")
