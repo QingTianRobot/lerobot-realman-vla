@@ -55,6 +55,7 @@ vendor/*
 
 # 临时脚本 (自述用完即删, 不纳入版本控制)
 .steam_monitor.sh
+.fix_steamvr_headless.py
 
 # 夹爪行程标定 (机器/硬件相关, 由 changingtek_gripper.py --calibrate 生成)
 hardware/gripper_calibration.json
