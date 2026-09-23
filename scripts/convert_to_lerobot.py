@@ -21,6 +21,7 @@ HDF5 → LeRobot v3 数据集转换
 
 import h5py
 import numpy as np
+import cv2
 from pathlib import Path
 import argparse
 import sys
@@ -40,8 +41,8 @@ def convert_hdf5_episode(hdf5_path: Path):
         data = {
             'qpos': np.array(f['observations/qpos']),        # (N, 7)
             'action': np.array(f['action']),                  # (N, 7)
-            'cam_high': np.array(f['observations/images/cam_high']),    # (N, H, W, 3)
-            'cam_wrist': np.array(f['observations/images/cam_wrist']),  # (N, H, W, 3)
+            'camera_global': np.array(f['observations/images/camera_global']),    # (N, H, W, 3)
+            'camera_left': np.array(f['observations/images/camera_left']),  # (N, H, W, 3)
         }
     return data
 
@@ -82,7 +83,7 @@ def main():
     sample_data = convert_hdf5_episode(hdf5_files[0])
     state_dim = sample_data['qpos'].shape[1]    # 7
     action_dim = sample_data['action'].shape[1]  # 7
-    img_h, img_w = sample_data['cam_high'].shape[1:3]
+    img_h, img_w = sample_data['camera_global'].shape[1:3]
 
     print(f"状态维度: {state_dim}, 动作维度: {action_dim}")
     print(f"图像尺寸: {img_h}x{img_w}")
@@ -97,12 +98,12 @@ def main():
             "names": ["joint_1", "joint_2", "joint_3", "joint_4",
                        "joint_5", "joint_6", "gripper"],
         },
-        "observation.images.cam_high": {
+        "observation.images.camera_global": {
             "dtype": "video",
             "shape": (img_h, img_w, 3),
             "names": ["height", "width", "channels"],
         },
-        "observation.images.cam_wrist": {
+        "observation.images.camera_left": {
             "dtype": "video",
             "shape": (img_h, img_w, 3),
             "names": ["height", "width", "channels"],
@@ -135,13 +136,17 @@ def main():
         total_frames += num_frames
 
         for frame_idx in range(num_frames):
+            # HDF5 里存的是相机 get_frame() 的 BGR (与推理脚本同源)，
+            # 而 PIL.Image.fromarray 默认按 RGB 解释，直接传入会红蓝互换
+            # (肤色手变蓝、蓝色筐变橙)。这里显式转成 RGB，与 inference.py 的
+            # cv2.COLOR_BGR2RGB 保持一致，保证训练/推理颜色分布相同。
             frame_data = {
                 "observation.state": torch.from_numpy(
                     data['qpos'][frame_idx].astype(np.float32)),
-                "observation.images.cam_high": Image.fromarray(
-                    data['cam_high'][frame_idx]),
-                "observation.images.cam_wrist": Image.fromarray(
-                    data['cam_wrist'][frame_idx]),
+                "observation.images.camera_global": Image.fromarray(
+                    cv2.cvtColor(data['camera_global'][frame_idx], cv2.COLOR_BGR2RGB)),
+                "observation.images.camera_left": Image.fromarray(
+                    cv2.cvtColor(data['camera_left'][frame_idx], cv2.COLOR_BGR2RGB)),
                 "action": torch.from_numpy(
                     data['action'][frame_idx].astype(np.float32)),
                 "task": args.task,
