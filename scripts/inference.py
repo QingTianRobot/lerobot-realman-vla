@@ -298,8 +298,8 @@ def main():
 
     # 检测输入特征
     input_features = policy.config.input_features
-    use_cam_high = 'observation.images.cam_high' in input_features
-    use_cam_wrist = 'observation.images.cam_wrist' in input_features
+    use_cam_high = 'observation.images.camera_global' in input_features
+    use_cam_wrist = 'observation.images.camera_left' in input_features
     print(f"      Input features: {list(input_features.keys())}")
 
     # 2. 初始化硬件
@@ -362,12 +362,12 @@ def main():
 
             if cam_top:
                 img = cv2.cvtColor(cam_top.get_frame(), cv2.COLOR_BGR2RGB)
-                observation['observation.images.cam_high'] = \
+                observation['observation.images.camera_global'] = \
                     torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
             if cam_wrist:
                 img = cv2.cvtColor(cam_wrist.get_frame(), cv2.COLOR_BGR2RGB)
-                observation['observation.images.cam_wrist'] = \
+                observation['observation.images.camera_left'] = \
                     torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
             # VLA 需要 language instruction

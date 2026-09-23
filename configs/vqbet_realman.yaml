@@ -20,7 +20,7 @@ policy:
 
   # 输入特征（VQ-BeT 只支持单图像）
   input_features:
-    observation.images.cam_wrist:
+    observation.images.camera_left:
       type: VISUAL
       shape: [3, 480, 640]
     observation.state:

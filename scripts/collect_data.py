@@ -14,8 +14,8 @@
 
 采集数据格式：HDF5
   - observations/qpos: (N, 7)   [6关节角 + 夹爪(归一化 0~1, 1=张开)]
-  - observations/images/cam_high: (N, H, W, 3)
-  - observations/images/cam_wrist: (N, H, W, 3)
+  - observations/images/camera_global: (N, H, W, 3)
+  - observations/images/camera_left: (N, H, W, 3)
   - action: (N, 7)              [下一帧的 qpos]
   - timestamps: (N,)            [相对时间戳(秒)]
 
@@ -57,8 +57,8 @@ GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /1
 # 标定: 手动把机械臂移到一个安全顺手的起始位, 读它的笛卡尔位姿填进来。
 #   ⚠️ 下面两个数组是上一套实物调的值, 安装不同必改 —— 否则按 w 时机械臂会突跳到旧位姿。
 #   POS 单位米 [x,y,z]; ORI 单位弧度 [rx,ry,rz]。
-ROBOT_INIT_POS = np.array([-0.218, 0.06, 0.357])
-ROBOT_INIT_ORI = np.array([-3.126, 0.001, -0.015])
+ROBOT_INIT_POS = np.array([-0.3435, -0.0228, 0.0729])
+ROBOT_INIT_ORI = np.array([3.109, 0.114, -0.139])
 # ============ 配置区域结束 ============
 
 
@@ -176,6 +176,8 @@ class ViveController:
     def _control_loop(self):
         """20Hz 遥控循环"""
         interval = 0.05
+        last_ret = 0      # 上一次 movep 返回码 (节流打印用)
+        last_err = None   # 上一次异常信息 (节流打印用)
 
         while self.running:
             time.sleep(interval)
@@ -194,7 +196,7 @@ class ViveController:
                 delta_ori = cur_ori - self.vive_init_ori
 
                 scale_pos = 0.5   # 位置灵敏度: 调大=机械臂动得比手多, 调小=更细腻
-                scale_ori = 0.3   # 姿态灵敏度: 同上, 作用于旋转
+                scale_ori = 0.8   # 姿态灵敏度: 同上, 作用于旋转 (原 0.3 太小, 转 30° 末端只转 9° 几乎看不出)
 
                 # ================= 坐标映射: Vive → Robot（现场标定就改这里）=================
                 # 数组三行依次对应机械臂的 X / Y / Z 轴。
@@ -230,10 +232,17 @@ class ViveController:
                 ]
 
                 with self.arm_lock:
-                    self.arm.rm_movep_canfd(target_6d, False, 0, 60)
+                    ret = self.arm.rm_movep_canfd(target_6d, False, 0, 60)
 
-            except Exception:
-                pass
+                # 诊断: 返回码非 0 = 逆解失败/姿态不可达, 机械臂会停在上一位姿 (节流打印)
+                if ret != 0 and ret != last_ret:
+                    print(f"[!] movep_canfd ret={ret} 姿态可能不可达 target_ori={target_ori}")
+                last_ret = ret
+
+            except Exception as e:  # noqa: BLE001 - 遥控循环不能因单次异常中断
+                if str(e) != last_err:
+                    print(f"[!] _control_loop 异常: {e}")
+                    last_err = str(e)
 
     def shutdown(self):
         self.running = False
@@ -245,8 +254,8 @@ class DataRecorder:
 
     数据格式:
       observations/qpos:             (N, 7) float32  [6关节角 + 夹爪位置]
-      observations/images/cam_high:  (N, H, W, 3) uint8
-      observations/images/cam_wrist: (N, H, W, 3) uint8
+      observations/images/camera_global:  (N, H, W, 3) uint8
+      observations/images/camera_left: (N, H, W, 3) uint8
       action:                        (N, 7) float32  [下一帧的qpos，即行为克隆标签]
       timestamps:                    (N,) float64    [相对时间戳(秒)]
     """
@@ -333,10 +342,10 @@ class DataRecorder:
                 f.create_dataset('observations/qpos', data=np.array(qpos))
                 f.create_dataset('action', data=np.array(actions))
                 f.create_dataset('timestamps', data=np.array(timestamps))
-                f.create_dataset('observations/images/cam_high',
+                f.create_dataset('observations/images/camera_global',
                                  data=np.array(self.data_buffer['images_top']),
                                  compression="gzip")
-                f.create_dataset('observations/images/cam_wrist',
+                f.create_dataset('observations/images/camera_left',
                                  data=np.array(self.data_buffer['images_wrist']),
                                  compression="gzip")
             print(f"保存: {os.path.basename(self.filename)} ({len(qpos)} frames)")
