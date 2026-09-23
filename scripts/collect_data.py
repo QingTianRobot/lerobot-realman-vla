@@ -31,6 +31,7 @@ import select
 import tty
 import termios
 import time
+import math
 import threading
 import sys
 import os
@@ -57,8 +58,16 @@ GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /1
 # 标定: 手动把机械臂移到一个安全顺手的起始位, 读它的笛卡尔位姿填进来。
 #   ⚠️ 下面两个数组是上一套实物调的值, 安装不同必改 —— 否则按 w 时机械臂会突跳到旧位姿。
 #   POS 单位米 [x,y,z]; ORI 单位弧度 [rx,ry,rz]。
-ROBOT_INIT_POS = np.array([-0.3435, -0.0228, 0.0729])
-ROBOT_INIT_ORI = np.array([3.109, 0.114, -0.139])
+ROBOT_INIT_POS = np.array([-0.0847, -0.2821, 0.0872])
+ROBOT_INIT_ORI = np.array([-3.102, 0.065, 1.609])
+
+# Vive Tracker → 机械臂末端 固定外参 (现场标定): XYZRPY = {0, 0, 80mm, 90°, 0°, -90°}
+#   · 平移 80mm 是 tracker 原点沿其轴到末端的固定偏置, 属常量, 已包含在 ROBOT_INIT 标定里;
+#     相对运动映射不需要它, 这里只用旋转部分。
+#   · 旋转 RPY(roll=90°, pitch=0°, yaw=-90°) 组成换基矩阵 M(R=Rz·Ry·Rx), 既管位置也管姿态:
+#       Robot_X = -Vive_Z, Robot_Y = -Vive_X, Robot_Z = +Vive_Y。
+#   · 现场若方向不对, 改这三个角度即可, 不用再逐轴翻符号/换下标。
+VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw(Z)] 单位度
 # ============ 配置区域结束 ============
 
 
@@ -84,15 +93,94 @@ def get_next_filename(save_dir, task_name):
     return os.path.join(save_dir, f"{task_name}_{idx}.hdf5")
 
 
+# ============ 姿态/坐标换算辅助 (纯 numpy, 无额外依赖) ============
+def _quat_to_matrix(q):
+    """四元数 [w,x,y,z] → 3×3 旋转矩阵"""
+    w, x, y, z = q
+    n = w * w + x * x + y * y + z * z
+    s = 0.0 if n == 0.0 else 2.0 / n
+    wx, wy, wz = s * w * x, s * w * y, s * w * z
+    xx, xy, xz = s * x * x, s * x * y, s * x * z
+    yy, yz, zz = s * y * y, s * y * z, s * z * z
+    return np.array([
+        [1.0 - (yy + zz), xy - wz,         xz + wy        ],
+        [xy + wz,         1.0 - (xx + zz), yz - wx        ],
+        [xz - wy,         yz + wx,         1.0 - (xx + yy)],
+    ])
+
+
+def _matrix_to_quat(R):
+    """3×3 旋转矩阵 → 四元数 [w,x,y,z] (标准健壮算法)"""
+    tr = np.trace(R)
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        w, x, y, z = 0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        w, x, y, z = (R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        w, x, y, z = (R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        w, x, y, z = (R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s
+    return np.array([w, x, y, z])
+
+
+def _euler_xyz_to_matrix(e):
+    """固定轴 XYZ(RPY) 欧拉角 [rx,ry,rz](弧度) → 3×3, R = Rz·Ry·Rx (与机械臂/Vive 约定一致)"""
+    rx, ry, rz = e
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    return np.array([
+        [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+        [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+        [-sy,     cy * sx,                cy * cx               ],
+    ])
+
+
+def _matrix_to_euler_xyz(R):
+    """3×3 → 固定轴 XYZ(RPY) 欧拉角 [rx,ry,rz](弧度), 为 _euler_xyz_to_matrix 的逆"""
+    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    if sy > 1e-6:
+        rx = math.atan2(R[2, 1], R[2, 2])
+        ry = math.atan2(-R[2, 0], sy)
+        rz = math.atan2(R[1, 0], R[0, 0])
+    else:  # 万向锁 (ry≈±90°)
+        rx = math.atan2(-R[1, 2], R[1, 1])
+        ry = math.atan2(-R[2, 0], sy)
+        rz = 0.0
+    return np.array([rx, ry, rz])
+
+
+def _scale_rotation(R, s):
+    """把旋转 R 的转角按 s 倍缩放(绕同一转轴), 用于姿态灵敏度; s=1 原样返回。"""
+    if abs(s - 1.0) < 1e-9:
+        return R
+    q = _matrix_to_quat(R)
+    if q[0] < 0:
+        q = -q                                  # 保证 w≥0, 转角落在 [-π, π]
+    vnorm = math.sqrt(q[1] ** 2 + q[2] ** 2 + q[3] ** 2)
+    if vnorm < 1e-9:
+        return np.eye(3)                        # 近乎无旋转
+    half = math.atan2(vnorm, q[0]) * s          # 半角 × s
+    axis = np.array([q[1], q[2], q[3]]) / vnorm
+    q2 = np.concatenate(([math.cos(half)], axis * math.sin(half)))
+    return _quat_to_matrix(q2)
+
+
 # ============ Vive 遥控模块 ============
 class ViveController:
     """Vive Tracker 遥操作控制器
 
-    原理：读取 Tracker 的笛卡尔位姿增量，映射到机械臂的笛卡尔空间。
-    坐标映射关系（Vive → Robot）：
+    原理：读取 Tracker 的位姿增量，用旋转矩阵映射到机械臂笛卡尔空间。
+    坐标系换基由固定外参 M = VIVE_TO_ROBOT_RPY_DEG 统一描述(位置/姿态共用):
       Robot_X = -Vive_Z
       Robot_Y = -Vive_X
       Robot_Z = +Vive_Y
+    姿态采用相对旋转 R_delta = R_cur · R_initᵀ 换基后叠加到起始姿态,
+    避免欧拉角逐轴相减在大角度/万向锁处失效。
     """
 
     def __init__(self, arm, arm_lock, tracker_serial=None, enable_vive=True):
@@ -103,9 +191,13 @@ class ViveController:
 
         self.robot_init_pos = ROBOT_INIT_POS.copy()
         self.robot_init_ori = ROBOT_INIT_ORI.copy()
+        # 起始姿态的旋转矩阵形式 (固定轴 XYZ/RPY: R = Rz·Ry·Rx)
+        self.robot_init_R = _euler_xyz_to_matrix(self.robot_init_ori)
+        # Vive→Robot 固定外参旋转矩阵 M (坐标系换基用)
+        self.vive_to_robot_rot = _euler_xyz_to_matrix(np.radians(VIVE_TO_ROBOT_RPY_DEG))
 
         self.vive_init_pos = None
-        self.vive_init_ori = None
+        self.vive_init_R = None       # 校准零点时 tracker 的旋转矩阵
         self.control_enabled = False
         self.running = True
         self.vive = None
@@ -119,24 +211,64 @@ class ViveController:
             print("示教模式: 不使用 Vive 遥控，手动移动机械臂")
 
     def _init_vive(self):
-        try:
-            # 需要 hardware/vive_tracker.py
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'hardware'))
-            import vive_tracker as triad_lib
-            self.vive = triad_lib.triad_openvr()
-            for name, device in self.vive.devices.items():
-                if "tracker" in name.lower():
-                    serial = device.get_serial()
-                    if serial == self.tracker_serial:
-                        self.tracker = device
-                        break
-            if self.tracker is None:
-                for name, device in self.vive.devices.items():
-                    if "tracker" in name.lower():
-                        self.tracker = device
-                        break
-        except Exception as e:
-            print(f"[!] Vive: {e}")
+        """阻塞式初始化 Vive：未连接时持续重试，直到发现 Tracker 才返回。
+
+        Vive/SteamVR 未就绪时 openvr.init() 会持续抛异常, 或 SteamVR 已就绪但枚举
+        不到 tracker；此处每 2s 重试一次, 直到拿到 tracker 为止。期间 Ctrl+C 可中断。
+        """
+        # 需要 hardware/vive_tracker.py; 依赖缺失(ImportError)属确定性错误, 直接抛出, 不重试
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'hardware'))
+        import vive_tracker as triad_lib
+
+        attempt = 0
+        last_msg = None
+        while self.running:
+            attempt += 1
+            try:
+                self.vive = triad_lib.triad_openvr()   # openvr.init 连接 SteamVR
+                self.tracker = self._pick_tracker()
+                if self.tracker is not None:
+                    print(f"Vive: Tracker 已连接 (SN {self.tracker.get_serial()})")
+                    return
+                msg = "SteamVR 已就绪但未发现 Tracker，请检查 Tracker 电源/基站"
+                # SteamVR 就绪但没枚举到 tracker: 必须先释放本次 openvr 会话,
+                # 否则下一轮重试再 openvr.init() 会泄漏会话, 退出后 SteamVR 侧连接不释放(需重插拔)
+                self.vive.shutdown()
+                self.vive = None
+            except KeyboardInterrupt:
+                # 等待期间 Ctrl+C: 构造函数未完成, main 里 vive_ctrl 未赋值, 无法调 shutdown,
+                # 因此必须在此释放已建立的 openvr 会话, 否则残留连接导致下次要重新插拔 Vive
+                if self.vive is not None:
+                    self.vive.shutdown()
+                    self.vive = None
+                raise
+            except Exception as e:  # noqa: BLE001 - SteamVR 未就绪会持续报错, 需重试
+                # 注意: 不捕获 KeyboardInterrupt, Ctrl+C 会自然传播以中断等待
+                self.vive = None
+                msg = f"{type(e).__name__}: {e}"
+
+            if msg != last_msg:
+                print(f"[!] Vive 未连接（{msg}）")
+                print("    等待中... 启动 SteamVR 并连接 Tracker 后自动继续；Ctrl+C 退出")
+                last_msg = msg
+            elif attempt % 10 == 0:
+                print(f"    仍在等待 Vive 连接...（{msg}）")
+            time.sleep(2.0)
+
+    def _pick_tracker(self):
+        """从已枚举设备里挑目标 tracker：优先匹配序列号，否则取第一个 tracker。"""
+        first = None
+        for name, device in self.vive.devices.items():
+            if "tracker" not in name.lower():
+                continue
+            try:
+                if device.get_serial() == self.tracker_serial:
+                    return device
+            except Exception:  # noqa: BLE001 - 个别设备读序列号可能失败，跳过继续
+                pass
+            if first is None:
+                first = device
+        return first
 
     def calibrate(self):
         """校准：记录当前 Vive Tracker 位姿作为零点"""
@@ -145,20 +277,25 @@ class ViveController:
             return False
 
         print("校准中... 保持 Tracker 静止")
-        poses = []
+        positions = []
+        quats = []          # [w,x,y,z]
         for _ in range(30):
-            euler = self.tracker.get_pose_euler()
-            if euler:
-                poses.append(euler)
+            pose = self.tracker.get_pose_quaternion()   # [x,y,z, w,qx,qy,qz]
+            if pose:
+                positions.append([pose[0], pose[1], pose[2]])
+                q = np.array([pose[3], pose[4], pose[5], pose[6]])
+                if quats and np.dot(q, quats[0]) < 0:
+                    q = -q  # 统一到同一半球, 避免四元数符号翻转导致平均抵消
+                quats.append(q)
             time.sleep(0.033)
 
-        if not poses:
+        if not quats:
             print("[!] 校准失败")
             return False
 
-        avg_pose = np.mean(poses, axis=0)
-        self.vive_init_pos = np.array([avg_pose[0], avg_pose[1], avg_pose[2]])
-        self.vive_init_ori = np.array([avg_pose[3], avg_pose[4], avg_pose[5]])
+        self.vive_init_pos = np.mean(positions, axis=0)
+        q_mean = np.mean(quats, axis=0)
+        self.vive_init_R = _quat_to_matrix(q_mean / np.linalg.norm(q_mean))
         print("校准完成")
         return True
 
@@ -181,50 +318,42 @@ class ViveController:
 
         while self.running:
             time.sleep(interval)
-            if not self.control_enabled or self.tracker is None or self.vive_init_pos is None:
+            if (not self.control_enabled or self.tracker is None
+                    or self.vive_init_pos is None or self.vive_init_R is None):
                 continue
 
             try:
-                euler = self.tracker.get_pose_euler()
-                if euler is None:
+                pose = self.tracker.get_pose_quaternion()   # [x,y,z, w,qx,qy,qz]
+                if pose is None:
                     continue
 
-                cur_pos = np.array([euler[0], euler[1], euler[2]])
-                cur_ori = np.array([euler[3], euler[4], euler[5]])
+                cur_pos = np.array([pose[0], pose[1], pose[2]])
+                R_cur = _quat_to_matrix(np.array([pose[3], pose[4], pose[5], pose[6]]))
 
-                delta_pos = cur_pos - self.vive_init_pos
-                delta_ori = cur_ori - self.vive_init_ori
+                scale_pos = 1   # 位置灵敏度: 调大=机械臂动得比手多, 调小=更细腻
+                scale_ori = 1   # 姿态灵敏度: 作用于相对旋转的转角 (原 0.3 太小, 转 30° 末端只转 9°)
 
-                scale_pos = 0.5   # 位置灵敏度: 调大=机械臂动得比手多, 调小=更细腻
-                scale_ori = 0.8   # 姿态灵敏度: 同上, 作用于旋转 (原 0.3 太小, 转 30° 末端只转 9° 几乎看不出)
+                # ================= 坐标映射: Vive → Robot（旋转矩阵法, 现场标定改外参）=================
+                # 固定外参 VIVE_TO_ROBOT_RPY_DEG={90,0,-90} 给出换基矩阵 M, 位置/姿态共用:
+                #   Robot_X=-Vive_Z, Robot_Y=-Vive_X, Robot_Z=+Vive_Y。
+                # 现场方向不对时, 改外参 RPY 即可(不用再逐轴翻符号/换下标)。
+                M = self.vive_to_robot_rot
 
-                # ================= 坐标映射: Vive → Robot（现场标定就改这里）=================
-                # 数组三行依次对应机械臂的 X / Y / Z 轴。
-                # 每行 = ±delta_pos[vive轴下标] * scale_pos
-                #   delta_pos 下标: 0=Vive_X, 1=Vive_Y, 2=Vive_Z
-                # 调法（按 w 启用后，手推 tracker 观察机械臂）:
-                #   · 某轴方向反了        → 把那一行的符号翻转（- 改 + 或 + 改 -）
-                #   · 推 A 方向却动了 B 轴 → 把那一行的 delta_pos 下标换成正确的 vive 轴
-                #   · 幅度太大/太小        → 调上面的 scale_pos
-                target_pos = self.robot_init_pos + np.array([
-                    -delta_pos[2] * scale_pos,   # Robot_X ← -Vive_Z（前后）
-                    -delta_pos[0] * scale_pos,   # Robot_Y ← -Vive_X（左右）
-                    delta_pos[1] * scale_pos     # Robot_Z ← +Vive_Y（上下）
-                ])
+                # 位置: Vive世界系位移增量 → 换基到机械臂基座系 → 叠加到起始位
+                delta_pos_vive = cur_pos - self.vive_init_pos
+                target_pos = self.robot_init_pos + (M @ delta_pos_vive) * scale_pos
 
-                # 姿态映射，规则同上；三行依次对应机械臂姿态的 Rx / Ry / Rz。
-                # delta_ori 下标: 0=yaw, 1=pitch, 2=roll（角度，故乘 π/180 转弧度）
-                target_ori = self.robot_init_ori + np.array([
-                    -delta_ori[2] * scale_ori * np.pi / 180,   # Rx ← -roll
-                    -delta_ori[1] * scale_ori * np.pi / 180,   # Ry ← -pitch
-                    delta_ori[0] * scale_ori * np.pi / 180     # Rz ← +yaw
-                ])
+                # 姿态: 相对旋转 R_delta=R_cur·R_initᵀ(世界系) → 换基 M·R·Mᵀ → 左乘起始姿态
+                R_delta = R_cur @ self.vive_init_R.T
+                R_delta = M @ R_delta @ M.T
+                R_delta = _scale_rotation(R_delta, scale_ori)   # 按 scale_ori 缩放转角
+                target_ori = _matrix_to_euler_xyz(R_delta @ self.robot_init_R)
 
                 # 安全限位（笛卡尔工作空间, 单位米）: 防止手滑把机械臂推出安全区。
                 # 换成你的实际可达范围; 若机械臂总在某方向到不了边界, 放宽对应上下限。
-                target_pos[0] = np.clip(target_pos[0], -0.5, 0.1)
-                target_pos[1] = np.clip(target_pos[1], -0.3, 0.3)
-                target_pos[2] = np.clip(target_pos[2], 0.1, 0.6)
+                target_pos[0] = np.clip(target_pos[0], -0.5, 0.5)
+                target_pos[1] = np.clip(target_pos[1], -0.5, 0.5)
+                target_pos[2] = np.clip(target_pos[2], -0.15, 0.3)
 
                 target_6d = [
                     float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
@@ -246,6 +375,12 @@ class ViveController:
 
     def shutdown(self):
         self.running = False
+        # 等控制线程退出后再释放 openvr, 避免线程仍调用已 shutdown 的句柄
+        if getattr(self, "thread", None) is not None:
+            self.thread.join(timeout=1.0)
+        if self.vive is not None:
+            self.vive.shutdown()   # triad_openvr.shutdown() → openvr.shutdown()
+            self.vive = None
 
 
 # ============ 数据录制模块 ============
@@ -402,11 +537,18 @@ def main():
     print(f"夹爪: {'OK' if gripper.connected else 'FAIL'} ({args.gripper_port})")
     arm_lock = threading.Lock()
 
-    # 初始化 Vive 遥控
-    vive_ctrl = ViveController(arm, arm_lock, tracker_serial=args.tracker_serial,
-                               enable_vive=not args.teaching)
-    if not args.teaching:
-        print(f"Vive: {'OK' if vive_ctrl.tracker else 'FAIL'}")
+    # 初始化 Vive 遥控（未连接时会阻塞等待直到 Tracker 就绪，Ctrl+C 可中断）
+    try:
+        vive_ctrl = ViveController(arm, arm_lock, tracker_serial=args.tracker_serial,
+                                   enable_vive=not args.teaching)
+    except KeyboardInterrupt:
+        print("\n[!] 已取消：等待 Vive 连接被中断")
+        cam_top.close()
+        cam_wrist.close()
+        gripper.disable()
+        gripper.disconnect()
+        arm.rm_delete_robot_arm()
+        sys.exit(1)
 
     # 初始化录制器
     recorder = DataRecorder(arm, arm_lock, gripper, cam_top, cam_wrist, args.fps)
