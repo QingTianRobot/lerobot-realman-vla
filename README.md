@@ -39,8 +39,8 @@
 ### ✨ 核心特性
 
 - 🎮 **Vive 遥操作采集**：基于 OpenVR 的低延迟遥操作，支持示教模式（手动拖动）
-- 📷 **双相机系统**：RealSense 顶部 + 腕部双视角，覆盖全局与精细观测
-- 🔧 **自主 Modbus 夹爪**：异步控制，不阻塞主循环
+- 📷 **双相机系统**：顶部 RealSense D435 + 腕部奥比中光 Gemini 305，覆盖全局与精细观测
+- 🔧 **知行 RTU 夹爪**：独立串口异步控制，与机械臂解耦，不阻塞主循环
 - 🧠 **多策略支持**：一套数据，多种策略对比训练
 - ⚡ **优化推理**：EMA 平滑 + 死区过滤 + Temporal Ensemble
 
@@ -64,11 +64,11 @@
 
 | 组件 | 型号 | 说明 |
 |------|------|------|
-| 机械臂 | 睿尔曼 RM65-B | 6自由度，TCP/IP通信 |
-| 夹爪 | FAE2M86C | Modbus RTU 协议 |
-| 遥操作 | HTC Vive Tracker 3.0 | OpenVR/SteamVR |
-| 顶部相机 | Intel RealSense D435i | 640×480@30fps |
-| 腕部相机 | Intel RealSense D435i | 640×480@30fps |
+| 机械臂 | 睿尔曼 RM65-B | 6自由度，TCP/IP通信（IP 192.168.5.123） |
+| 夹爪 | 知行 RTU 平动手 | Modbus RTU，独立串口 `/dev/realman/gripper_left` |
+| 遥操作 | Vive Tracker (Pika Sense viva) | OpenVR/SteamVR |
+| 顶部相机 | Intel RealSense D435 | 640×480@30fps |
+| 腕部相机 | 奥比中光 Gemini 305 | 640×480@30fps (pyorbbecsdk) |
 | 训练 GPU | NVIDIA RTX 4080 Laptop | 12GB VRAM |
 
 <details>
@@ -100,9 +100,11 @@ lerobot-realman-vla/
 ├── README.md                     # 本文档
 ├── README_EN.md                  # English README
 ├── LICENSE                       # Apache 2.0
-├── requirements.txt              # Python依赖
+├── requirements.txt              # Python依赖 (pin lerobot==0.4.3)
+├── uv.toml                       # uv 镜像配置 (阿里云)
 ├── .gitignore                    # Git忽略规则
-├── setup.sh                      # 一键环境搭建
+├── setup.sh                      # 一键环境搭建 (uv)
+├── env.sh                        # 环境激活: source env.sh
 │
 ├── scripts/                      # 🔧 核心脚本
 │   ├── collect_data.py           # Step 1: 数据采集
@@ -120,15 +122,20 @@ lerobot-realman-vla/
 │
 ├── hardware/                     # 🔌 硬件驱动
 │   ├── vive_tracker.py           # Vive Tracker OpenVR接口
+│   ├── orbbec_camera.py          # 腕部相机 奥比中光 Gemini 305 (pyorbbecsdk)
+│   ├── changingtek_gripper.py    # 知行 RTU 夹爪归一化封装
 │   └── README.md                 # 硬件配置指南
 │
 ├── docs/                         # 📚 技术文档
 │   ├── pipeline_guide.md         # 完整流程指南（含踩坑记录）
-│   ├── technical_details.md      # 架构与技术细节
+│   ├── data_collection.md        # 数据采集指南（自检/标定/逐条流程）
 │   └── troubleshooting.md        # 常见问题排查
 │
-└── examples/                     # 📝 示例
-    └── README.md                 # 示例数据说明
+├── examples/                     # 📝 示例
+│   └── README.md                 # 示例数据说明
+│
+├── data/                         # 📦 数据集 (raw_hdf5 + lerobot 格式; 内容 git 忽略)
+└── outputs/                      # 📦 训练产物 (checkpoints; 内容 git 忽略)
 ```
 
 ---
@@ -137,33 +144,57 @@ lerobot-realman-vla/
 
 ### 1. 环境安装
 
+本项目用 [uv](https://docs.astral.sh/uv/) 管理环境（Python 3.10，仓库内 `.venv`），镜像走阿里云（见 `uv.toml`）。
+
 ```bash
 # 克隆本项目
 git clone https://github.com/Humble2Full/lerobot-realman-vla.git
 cd lerobot-realman-vla
 
-# 一键安装（创建conda环境 + 安装依赖）
+# 一键安装（uv 建 .venv + 装依赖 + 装 pyorbbecsdk2 + 验证）
 bash setup.sh
-
-# 或手动安装
-conda create -n lerobot python=3.10 -y
-conda activate lerobot
-pip install -r requirements.txt
 ```
 
+> 未装 uv 时：`curl -LsSf https://astral.sh/uv/install.sh | sh`
+>
+> 手动安装等价于：
+> ```bash
+> uv venv --python 3.10 .venv
+> uv pip install -r requirements.txt           # lerobot==0.4.3 + torch + 驱动 (勿升级 lerobot)
+> uv pip install --no-deps pyorbbecsdk2==2.1.2  # 腕部 Orbbec 相机 (依赖冲突, 需 --no-deps)
+> ```
+
+**每次使用前先激活环境**（会自动修好 Orbbec 库路径）：
+
+```bash
+source env.sh
+```
+
+> ⚠️ **腕部 Orbbec 相机库路径**：`pyorbbecsdk` 的 `libOrbbecSDK.so.2` 会被 `/opt/ros/humble` 旧库覆盖，
+> 直接 import 报 `undefined symbol: ob_application_config_set_struct`。`source env.sh` 已自动把 `.venv`
+> 自带库目录前置到 `LD_LIBRARY_PATH` 解决；若手动激活 `.venv`，需自行 export：
+> ```bash
+> export LD_LIBRARY_PATH=$(python -c "import pyorbbecsdk,os;print(os.path.dirname(pyorbbecsdk.__file__))"):$LD_LIBRARY_PATH
+> ```
+
 ### 2. 数据采集
+
+> 📖 详细采集步骤（硬件自检、夹爪/Vive 标定、逐条流程、数据检查）见 [数据采集指南](docs/data_collection.md)。
 
 ```bash
 # Vive 遥操作模式
 python scripts/collect_data.py \
-    --arm-ip <YOUR_ARM_IP> \
+    --arm-ip 192.168.5.123 \
+    --gripper-port /dev/realman/gripper_left \
+    --cam-top 262322074840 \
+    --cam-wrist CV2T66100096 \
     --save-dir data/raw_hdf5 \
     --task-name pick_cube \
     --fps 30
 
 # 示教模式（手动拖动，无需Vive）
 python scripts/collect_data.py \
-    --arm-ip <YOUR_ARM_IP> \
+    --arm-ip 192.168.5.123 \
     --save-dir data/raw_hdf5 \
     --task-name pick_cube \
     --fps 30 \
@@ -200,7 +231,10 @@ bash scripts/train.sh act resume
 ```bash
 python scripts/inference.py \
     --model outputs/act_realman/checkpoints/100000/pretrained_model \
-    --arm-ip <YOUR_ARM_IP> \
+    --arm-ip 192.168.5.123 \
+    --gripper-port /dev/realman/gripper_left \
+    --cam-top 262322074840 \
+    --cam-wrist CV2T66100096 \
     --freq 30
 ```
 
@@ -254,7 +288,7 @@ python scripts/inference.py --task "pick up the cube"
 | 文档 | 说明 |
 |------|------|
 | [完整流程指南](docs/pipeline_guide.md) | 采集→转换→训练→推理的操作手册（含踩坑记录） |
-| [技术细节](docs/technical_details.md) | 策略架构、推理优化、参数调整经验 |
+| [数据采集指南](docs/data_collection.md) | 遥操/示教采集详细步骤（自检、标定、逐条流程） |
 | [常见问题](docs/troubleshooting.md) | 实际遇到的问题和排查过程 |
 | [硬件配置](hardware/README.md) | 机械臂、夹爪、相机、Vive 配置 |
 

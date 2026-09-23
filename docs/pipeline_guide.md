@@ -4,9 +4,11 @@
 
 ## Step 1: 数据采集
 
+> 📖 详细采集指南（硬件自检、夹爪/Vive 标定、逐条流程、数据检查）见 [数据采集指南](data_collection.md)。本节为速查。
+
 ### 采集命令
 
-> 采集前确认：机械臂可达（`ping <YOUR_ARM_IP>`）、两个 RealSense 均识别（`rs-enumerate-devices`）、SteamVR 中 Tracker 在线。
+> 采集前确认：机械臂可达（`ping <YOUR_ARM_IP>`）、顶部 D435（`rs-enumerate-devices`）与腕部 Orbbec 305 均识别、SteamVR 中 Tracker 在线。
 
 ```bash
 # Vive 遥操作
@@ -33,7 +35,7 @@ python scripts/collect_data.py \
 | `w` / `e` | 启用/停止遥控 | |
 | `s` / `d` | 开始/停止录制 | |
 | `c` / `o` | 夹爪闭合/打开 | |
-| `g 50` | 夹爪开到 50% | 0=全开，100=全闭 |
+| `g 50` | 夹爪开到 50% | 0=闭合，100=张开 |
 | `q` | 退出 | |
 
 ### 数据量参考

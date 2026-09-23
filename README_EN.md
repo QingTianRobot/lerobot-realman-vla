@@ -77,7 +77,7 @@ python scripts/inference.py \
 ## Documentation
 
 - [Pipeline Guide](docs/pipeline_guide.md) — Step-by-step instructions
-- [Technical Details](docs/technical_details.md) — Architecture and design decisions
+- [Data Collection Guide](docs/data_collection.md) — Teleoperation/teaching collection (self-checks, calibration, per-episode workflow)
 - [Troubleshooting](docs/troubleshooting.md) — Common issues and solutions
 - [Hardware Setup](hardware/README.md) — Hardware configuration guide
 
