@@ -32,6 +32,7 @@
 import torch
 import numpy as np
 import time
+import os
 import sys
 import threading
 import cv2
@@ -40,19 +41,27 @@ import argparse
 from pathlib import Path
 
 # ============ 默认硬件配置（根据你的硬件修改） ============
-DEFAULT_ARM_IP = "<YOUR_ARM_IP>"           # 出厂默认 192.168.2.18
+DEFAULT_ARM_IP = "192.168.5.123"
 DEFAULT_ARM_PORT = 8080
-DEFAULT_CAM_TOP_SERIAL = "<YOUR_TOP_CAM_SN>"     # rs-enumerate-devices | grep Serial
-DEFAULT_CAM_WRIST_SERIAL = "<YOUR_WRIST_CAM_SN>"
+DEFAULT_CAM_TOP_SERIAL = "262322074840"      # 顶部 D435 (rs-enumerate-devices | grep Serial)
+DEFAULT_CAM_WRIST_SERIAL = "CV2T66100096"    # 腕部 Orbbec 305 (留空取第一个设备)
 
-# Modbus 夹爪参数
-GRIPPER_MODBUS_PORT = 1
-GRIPPER_MODBUS_ADDR = 43
-GRIPPER_MODBUS_DEVICE = 1
-GRIPPER_MODBUS_NUM = 2
+# 知行 RTU 夹爪参数（独立串口，与机械臂解耦）
+GRIPPER_PORT = "/dev/realman/gripper_left"
+GRIPPER_SLAVE_ID = 2          # 知行夹爪 Modbus 从站地址
+GRIPPER_BAUDRATE = 115200
+GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准 (需与采集时一致)
 
 # 训练数据典型起始位姿（根据你的数据修改）
 INIT_POSE = np.array([-15.0, 3.0, 89.0, 0.5, 86.0, -15.0, 1.0], dtype=np.float32)
+
+# ------ 硬件模块路径 ------
+_HARDWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hardware')
+if _HARDWARE_DIR not in sys.path:
+    sys.path.insert(0, _HARDWARE_DIR)
+from orbbec_camera import OrbbecCamera              # 腕部相机 (奥比中光)
+from realsense_camera import RealSenseCamera        # 顶部相机 (Intel RealSense D435)
+from changingtek_gripper import ChangingtekGripper   # 知行夹爪
 
 
 # ============ 版本兼容性补丁 ============
@@ -145,79 +154,8 @@ def load_policy(model_path: str, device: torch.device):
 
 
 # ============ 辅助函数 ============
-def dec_to_register(dec):
-    """小数(0~1) → Modbus 寄存器值"""
-    value = dec * 256000
-    R0 = int(value // (256 ** 3))
-    remainder = value % (256 ** 3)
-    R1 = int(remainder // (256 ** 2))
-    remainder = remainder % (256 ** 2)
-    R2 = int(remainder // 256)
-    R3 = int(remainder % 256)
-    return [R0, R1, R2, R3]
-
-
-def register_to_dec(register_value):
-    """Modbus 寄存器值 → 小数(0~1)"""
-    return (register_value[0] * 256**3 + register_value[1] * 256**2 +
-            register_value[2] * 256 + register_value[3]) / 256000
-
-
-# ============ RealSense 相机 ============
-import pyrealsense2 as rs
-
-
-class RealSenseCamera:
-    """RealSense 相机异步采集"""
-
-    def __init__(self, serial_number, width=640, height=480, fps=30):
-        self.serial_number = str(serial_number)
-        self.width, self.height = width, height
-        self.latest_color = np.zeros((height, width, 3), dtype=np.uint8)
-        self.lock = threading.Lock()
-        self.stopped = False
-
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self.config.enable_device(self.serial_number)
-        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-
-        try:
-            profile = self.pipeline.start(self.config)
-            color_sensor = profile.get_device().first_color_sensor()
-            if color_sensor.supports(rs.option.enable_auto_exposure):
-                color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-            if color_sensor.supports(rs.option.exposure):
-                color_sensor.set_option(rs.option.exposure, 150)
-            self.thread = threading.Thread(target=self._update_loop, daemon=True)
-            self.thread.start()
-            print(f"[✓] Camera {self.serial_number} OK")
-        except Exception as e:
-            print(f"[✗] Camera {self.serial_number}: {e}")
-            raise
-
-    def _update_loop(self):
-        while not self.stopped:
-            try:
-                frames = self.pipeline.wait_for_frames(timeout_ms=2000)
-                color_frame = frames.get_color_frame()
-                if color_frame:
-                    frame_data = np.asanyarray(color_frame.get_data())
-                    with self.lock:
-                        self.latest_color = frame_data.copy()
-            except Exception:
-                pass
-
-    def get_frame(self):
-        with self.lock:
-            return self.latest_color.copy()
-
-    def close(self):
-        self.stopped = True
-        try:
-            self.pipeline.stop()
-        except Exception:
-            pass
+# 夹爪已改为知行 RTU 独立串口控制，归一化转换由 ChangingtekGripper 内部处理，
+# 不再需要 Modbus 寄存器编解码。
 
 
 # ============ 机械臂控制器 ============
@@ -230,13 +168,12 @@ class RobotController:
       - 异步夹爪: Modbus 写入在独立线程，不阻塞主控制循环
     """
 
-    def __init__(self, arm, gripper_params):
+    def __init__(self, arm, gripper):
         self.arm = arm
-        self.gripper_params = gripper_params
+        self.gripper = gripper
         self.lock = threading.Lock()
 
         self._last_gripper_cmd = None
-        self._cached_gripper_pos = 0.5
         self._smoothed_action = None
         self._last_joint_cmd = None
         self.ema_alpha = 0.3       # EMA 系数 (0.3=平滑, 0.7=响应快)
@@ -251,14 +188,7 @@ class RobotController:
             if skip_gripper:
                 gripper_pos = 0.5 if self._last_gripper_cmd is None else float(self._last_gripper_cmd)
             else:
-                gripper_pos = self._cached_gripper_pos
-                try:
-                    ret, gripper_reg = self.arm.rm_read_multiple_holding_registers(self.gripper_params)
-                    if ret == 0 and gripper_reg:
-                        gripper_pos = 1 - register_to_dec(gripper_reg)
-                        self._cached_gripper_pos = gripper_pos
-                except Exception:
-                    pass
+                gripper_pos = self.gripper.get_position_normalized()
 
             return np.array(joint_angles + [gripper_pos], dtype=np.float32)
 
@@ -289,44 +219,21 @@ class RobotController:
                 self.arm.rm_movej(joint_target.tolist(), 50, 0, 0, 0)
                 self._last_joint_cmd = joint_target.copy()
 
-            # 异步夹爪
+            # 夹爪（知行 RTU 已内部异步下发，无需再起线程）
             gripper_binary = 1 if qpos[6] > 0.5 else 0
             if self._last_gripper_cmd != gripper_binary:
                 self._last_gripper_cmd = gripper_binary
-                threading.Thread(
-                    target=self._try_write_gripper,
-                    args=(gripper_binary,),
-                    daemon=True
-                ).start()
-
-    def _try_write_gripper(self, gripper_binary):
-        """异步夹爪写入（失败静默）"""
-        try:
-            gripper_target = 1.0 - float(gripper_binary)
-            gripper_reg = dec_to_register(gripper_target)
-            write_params = type(self.gripper_params)(
-                port=self.gripper_params.port,
-                address=self.gripper_params.address,
-                device=self.gripper_params.device,
-                num=self.gripper_params.num
-            )
-            self.arm.rm_write_registers(write_params, gripper_reg)
-        except Exception:
-            pass
+                if gripper_binary:
+                    self.gripper.open()
+                else:
+                    self.gripper.close()
 
     def move_to_init(self, init_pose):
         """移动到初始位姿（阻塞）"""
         print(f"移动到初始位姿...")
         self.arm.rm_movej(init_pose[:6].tolist(), 80, 0, 0, 1)
 
-        gripper_reg = dec_to_register(1.0 - init_pose[6])
-        write_params = type(self.gripper_params)(
-            port=self.gripper_params.port,
-            address=self.gripper_params.address,
-            device=self.gripper_params.device,
-            num=self.gripper_params.num
-        )
-        self.arm.rm_write_registers(write_params, gripper_reg)
+        self.gripper.move_normalized(float(init_pose[6]))
         time.sleep(1.0)
 
     def stop(self):
@@ -336,6 +243,11 @@ class RobotController:
             pass
 
     def close(self):
+        try:
+            self.gripper.disable()
+            self.gripper.disconnect()
+        except Exception:
+            pass
         self.arm.rm_delete_robot_arm()
 
 
@@ -346,8 +258,10 @@ def main():
                         help='模型路径 (如 outputs/act/checkpoints/100000/pretrained_model)')
     parser.add_argument('--arm-ip', type=str, default=DEFAULT_ARM_IP, help='机械臂IP')
     parser.add_argument('--arm-port', type=int, default=DEFAULT_ARM_PORT, help='机械臂端口')
-    parser.add_argument('--cam-top', type=str, default=DEFAULT_CAM_TOP_SERIAL, help='顶部相机序列号')
-    parser.add_argument('--cam-wrist', type=str, default=DEFAULT_CAM_WRIST_SERIAL, help='腕部相机序列号')
+    parser.add_argument('--cam-top', type=str, default=DEFAULT_CAM_TOP_SERIAL, help='顶部相机(D435)序列号')
+    parser.add_argument('--cam-wrist', type=str, default=DEFAULT_CAM_WRIST_SERIAL, help='腕部相机(Orbbec 305)序列号，留空取第一个设备')
+    parser.add_argument('--gripper-port', type=str, default=GRIPPER_PORT, help='知行夹爪串口')
+    parser.add_argument('--gripper-slave-id', type=int, default=GRIPPER_SLAVE_ID, help='知行夹爪 Modbus 从站地址')
     parser.add_argument('--freq', type=float, default=15.0,
                         help='控制频率(Hz)，应与训练数据fps一致')
     parser.add_argument('--task', type=str, default='pick up the cube',
@@ -363,7 +277,7 @@ def main():
 
     # 导入机械臂SDK
     from Robotic_Arm.rm_robot_interface import (
-        RoboticArm, rm_thread_mode_e, rm_peripheral_read_write_params_t
+        RoboticArm, rm_thread_mode_e
     )
     from lerobot.processor.pipeline import DataProcessorPipeline
 
@@ -396,18 +310,25 @@ def main():
         raise RuntimeError(f"机械臂连接失败: {args.arm_ip}:{args.arm_port}")
 
     arm.rm_stop_drag_teach()
-    arm.rm_set_tool_voltage(3)
-    arm.rm_set_modbus_mode(GRIPPER_MODBUS_PORT, 9600, 2)
-    time.sleep(0.3)
 
-    gripper_params = rm_peripheral_read_write_params_t(
-        port=GRIPPER_MODBUS_PORT, address=GRIPPER_MODBUS_ADDR,
-        device=GRIPPER_MODBUS_DEVICE, num=GRIPPER_MODBUS_NUM
+    # 初始化知行夹爪（独立串口，与机械臂解耦）
+    gripper = ChangingtekGripper(
+        port=args.gripper_port, slave_id=args.gripper_slave_id,
+        baudrate=GRIPPER_BAUDRATE, max_position=GRIPPER_MAX_POSITION,
     )
-    robot = RobotController(arm, gripper_params)
+    gripper.connect()
+    print(f"      夹爪: {'OK' if gripper.connected else 'FAIL'} ({args.gripper_port})")
+    robot = RobotController(arm, gripper)
 
     cam_top = RealSenseCamera(args.cam_top) if use_cam_high else None
-    cam_wrist = RealSenseCamera(args.cam_wrist) if use_cam_wrist else None
+    # 重构后 RealSenseCamera 失败不再 raise (改为 is_active=False), 这里补上 fail-fast,
+    # 避免推理时静默使用黑帧。排查参见 hardware/README.md → RealSense USB 断联 / 设备占用排查。
+    if use_cam_high and not cam_top.is_active:
+        raise RuntimeError(
+            f"顶部 RealSense D435 初始化失败 (serial={args.cam_top}); "
+            f"先试 pkill -f realsense 或物理拔插 USB 后重试"
+        )
+    cam_wrist = OrbbecCamera(args.cam_wrist) if use_cam_wrist else None
     time.sleep(1)
 
     # 3. 移动到初始位姿
@@ -469,7 +390,7 @@ def main():
             elapsed = time.time() - start_time
             if step_count % 10 == 0:
                 actual_freq = 1.0 / elapsed if elapsed > 0 else 0
-                gripper_state = "闭合" if action[6] > 0.5 else "打开"
+                gripper_state = "张开" if action[6] > 0.5 else "闭合"
                 print(f"[{policy_type}] Step {step_count:4d} | "
                       f"J1:{qpos[0]:6.1f}→{action[0]:6.1f} | "
                       f"夹爪:{gripper_state} | {actual_freq:.1f}Hz")
