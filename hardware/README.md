@@ -25,6 +25,7 @@ arm.rm_set_arm_run_mode(1)     # 设置运行模式
 |-----|------|------|
 | `rm_movej(joints, speed, 0, 0, 1)` | 关节空间运动 | 阻塞 |
 | `rm_movej(joints, speed, 0, 0, 0)` | 关节空间运动 | 非阻塞 |
+| `rm_movej_p(pose, speed, 0, 0, 1)` | 关节空间规划到笛卡尔位姿（采集脚本归位/复位，大位移最稳、不撞奇异点） | 阻塞 |
 | `rm_movep_canfd(pose, False, 0, 60)` | 笛卡尔空间CANFD | 非阻塞 |
 | `rm_get_current_arm_state()` | 获取当前状态 | - |
 

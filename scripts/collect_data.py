@@ -35,6 +35,7 @@ import math
 import threading
 import sys
 import os
+import json
 import h5py
 import numpy as np
 import cv2
@@ -68,6 +69,15 @@ ROBOT_INIT_ORI = np.array([-3.102, 0.065, 1.609])
 #       Robot_X = -Vive_Z, Robot_Y = -Vive_X, Robot_Z = +Vive_Y。
 #   · 现场若方向不对, 改这三个角度即可, 不用再逐轴翻符号/换下标。
 VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw(Z)] 单位度
+
+# 机械臂归位 (rm_movej_p: 关节空间规划到 ROBOT_INIT 笛卡尔位姿, 大位移最稳、不撞奇异点)
+ARM_HOME_SPEED_SLOW = 10     # 启动慢速归位速度百分比 v(1~100): 上电位姿未知, 求稳
+ARM_HOME_SPEED_NORMAL = 45   # 复位键常速归位速度百分比
+ARM_HOME_COUNTDOWN = 3       # 启动归位前倒计时秒数, 留时间清空机械臂周围
+# 运行模式: 规划运动(movej_p)用自动模式; CANFD 遥操透传(movep_canfd)沿用现有模式 1。
+# 归位期间临时切自动模式、完成后切回, 两端互不影响 (归位时遥操必为暂停)。
+ARM_RUN_MODE_AUTO = 0
+ARM_RUN_MODE_TELEOP = 1
 # ============ 配置区域结束 ============
 
 
@@ -77,6 +87,9 @@ VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw
 _HARDWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hardware')
 if _HARDWARE_DIR not in sys.path:
     sys.path.insert(0, _HARDWARE_DIR)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_KEYBINDINGS_PATH = os.path.join(_REPO_ROOT, "configs", "keybindings.json")
 
 from orbbec_camera import OrbbecCamera              # 腕部相机 (奥比中光)
 from realsense_camera import RealSenseCamera        # 顶部相机 (Intel RealSense D435)
@@ -488,6 +501,206 @@ class DataRecorder:
             print(f"[!] 保存失败: {e}")
 
 
+# ============ 按键表 (terminal / web 前端共用) ============
+# 内置兜底按键表: configs/keybindings.json 缺失或损坏时使用, 保证脚本仍可运行。
+# 字段: key=单键; action=动作名(对应 CollectorController.action_<name>);
+#       args=动作参数(可选); label=界面显示; modes=可选["vive"|"teaching"](缺省=通用)。
+FALLBACK_BINDINGS = [
+    {"key": "v", "action": "calibrate_vive", "label": "校准 Vive 零点", "modes": ["vive"]},
+    {"key": "w", "action": "toggle_teleop",  "label": "遥控 开/关",     "modes": ["vive"]},
+    {"key": "s", "action": "toggle_record",  "label": "录制 开始/保存"},
+    {"key": "h", "action": "reset_arm",      "label": "复位到起始位(常速)"},
+    {"key": "o", "action": "gripper_open",   "label": "夹爪张开"},
+    {"key": "c", "action": "gripper_close",  "label": "夹爪闭合"},
+    {"key": "1", "action": "gripper_pct", "args": {"pct": 30}, "label": "夹爪 30%"},
+    {"key": "2", "action": "gripper_pct", "args": {"pct": 60}, "label": "夹爪 60%"},
+    {"key": "q", "action": "quit",           "label": "退出"},
+]
+
+
+def load_keybindings(path):
+    """读取 JSON 按键表; 缺失/损坏时回退到内置默认, 保证脚本仍可运行。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bindings = data.get("bindings") if isinstance(data, dict) else data
+        if not isinstance(bindings, list) or not bindings:
+            raise ValueError("bindings 为空或格式错误")
+        return bindings
+    except (OSError, ValueError) as e:
+        print(f"[!] 按键表 {path} 加载失败({e}), 使用内置默认")
+        return FALLBACK_BINDINGS
+
+
+def binding_available(binding, teaching):
+    """按 modes 字段判断按键在当前模式是否可用 (无 modes = 两种模式通用)。"""
+    modes = binding.get("modes")
+    if not modes:
+        return True
+    return ("teaching" if teaching else "vive") in modes
+
+
+def build_keymap(bindings, teaching):
+    """按键字符 -> binding 映射 (仅收录当前模式可用、且为单键的绑定)。"""
+    keymap = {}
+    for b in bindings:
+        key = b.get("key")
+        if isinstance(key, str) and len(key) == 1 and binding_available(b, teaching):
+            keymap[key] = b
+    return keymap
+
+
+def print_command_table(bindings, teaching):
+    """据按键表打印命令提示 (只列当前模式可用的键)。"""
+    print("-" * 50)
+    print("单键即触发 (无需回车):")
+    for b in bindings:
+        if binding_available(b, teaching):
+            print(f"  [{b.get('key')}] {b.get('label', b.get('action'))}")
+    print("  [Ctrl+C] 强制退出")
+    print("-" * 50)
+
+
+# ============ 动作层 (terminal / web 前端共用) ============
+class CollectorController:
+    """把每个操作封装成命名动作, 供 terminal 与 web 前端共用, 保证两端行为一致。
+
+    - dispatch(name, args): 按动作名分发到 action_<name> 方法;
+    - snapshot()/print_status(): 统一状态, 供 terminal 状态行与后续 web 推送复用;
+    - move_to_init(): 机械臂归位统一入口 (rm_movej_p 关节空间规划到笛卡尔位姿)。
+    """
+
+    _ACTION_PREFIX = "action_"
+
+    def __init__(self, arm, arm_lock, gripper, vive_ctrl, recorder,
+                 save_dir, task_name, teaching=False):
+        self.arm = arm
+        self.arm_lock = arm_lock
+        self.gripper = gripper
+        self.vive = vive_ctrl
+        self.recorder = recorder
+        self.save_dir = save_dir
+        self.task_name = task_name
+        self.teaching = teaching
+        self.quit_requested = False
+        self.saved_count = 0
+        # ROBOT_INIT 合成 6 维笛卡尔位姿 [x,y,z, rx,ry,rz] (米/弧度), 供 movej_p 使用
+        self.robot_init_pose = [float(x) for x in
+                                (list(ROBOT_INIT_POS) + list(ROBOT_INIT_ORI))]
+
+    # ---------- 机械臂归位 ----------
+    def move_to_init(self, speed, block=1, countdown=0, label="归位"):
+        """rm_movej_p 关节空间规划到 ROBOT_INIT (大位移最稳、不撞奇异点)。
+
+        规划运动需自动模式(ARM_RUN_MODE_AUTO); 遥操 CANFD 透传用模式 1, 故归位期间
+        临时切自动模式、完成后切回, 两端互不影响 (归位时遥操必为暂停)。
+        失败仅打印告警、不下发危险运动; ret!=0 多为位姿不可达, 见 ROBOT_INIT 标定。
+        """
+        if countdown > 0:
+            print(f"[!] 机械臂即将{label}到起始位, 请清空周围! {countdown} 秒后开始...")
+            for i in range(countdown, 0, -1):
+                print(f"    {i}...", flush=True)
+                time.sleep(1.0)
+        self.arm.rm_set_arm_run_mode(ARM_RUN_MODE_AUTO)
+        try:
+            with self.arm_lock:
+                ret = self.arm.rm_movej_p(self.robot_init_pose, int(speed), 0, 0, int(block))
+        finally:
+            self.arm.rm_set_arm_run_mode(ARM_RUN_MODE_TELEOP)
+        if ret != 0:
+            print(f"[!] {label}失败: rm_movej_p ret={ret} (位姿可能不可达, 检查 ROBOT_INIT 标定)")
+            return False
+        print(f"[✓] {label}完成 (v={speed}%)")
+        return True
+
+    # ---------- 动作 (每个 action_<name> 对应按键表里的一个动作) ----------
+    def action_calibrate_vive(self, **_):
+        if self.teaching:
+            print("[i] 示教模式无 Vive 校准")
+            return
+        self.vive.calibrate()
+
+    def action_toggle_teleop(self, **_):
+        """单键 toggle: 遥控 开<->关 (原 w/e 合并)。"""
+        if self.teaching:
+            print("[i] 示教模式无遥操")
+            return
+        if self.vive.control_enabled:
+            self.vive.disable()
+        else:
+            self.vive.enable()
+        self.print_status()
+
+    def action_toggle_record(self, **_):
+        """单键 toggle: 录制 开始<->停止并保存 (原 s/d 合并), 自动递增文件名。"""
+        if self.recorder.is_recording:
+            self.recorder.stop()
+            self.saved_count += 1
+        else:
+            filename = get_next_filename(self.save_dir, self.task_name)
+            self.recorder.start(filename)
+        self.print_status()
+
+    def action_reset_arm(self, **_):
+        """复位键: 常速归位到 ROBOT_INIT。复位前自动暂停遥操 (需手动重新启用)。"""
+        if self.recorder.is_recording:
+            print("[!] 录制中无法复位, 请先停止录制 (s)")
+            return
+        if not self.teaching and self.vive.control_enabled:
+            self.vive.disable()
+            time.sleep(0.15)   # 等一个控制周期, 让在途透传指令发完, 避免与归位争锁后补发旧位姿
+            print("[i] 复位前已暂停遥操; 如需遥操请重新校准 (v) 后启用 (w)")
+        self.move_to_init(ARM_HOME_SPEED_NORMAL, block=1, countdown=0, label="复位")
+        self.print_status()
+
+    def action_gripper_open(self, **_):
+        self.gripper.open()
+        print("夹爪: 张开")
+
+    def action_gripper_close(self, **_):
+        self.gripper.close()
+        print("夹爪: 闭合")
+
+    def action_gripper_pct(self, pct=100, **_):
+        pct = max(0, min(100, int(pct)))
+        self.gripper.move_pct(pct)
+        print(f"夹爪: {pct}%")
+
+    def action_quit(self, **_):
+        self.quit_requested = True
+
+    # ---------- 分发 / 状态 ----------
+    def dispatch(self, name, args=None):
+        """按动作名分发; 单个动作异常不中断采集循环。"""
+        method = getattr(self, self._ACTION_PREFIX + str(name), None)
+        if not callable(method):
+            print(f"[!] 未知动作: {name}")
+            return False
+        try:
+            method(**(args or {}))
+        except Exception as e:  # noqa: BLE001 - 单个动作异常不应中断整个采集循环
+            print(f"[!] 动作 {name} 异常: {e}")
+        return True
+
+    def snapshot(self):
+        """当前状态快照 (terminal 状态行 / 后续 web 推送共用)。"""
+        return {
+            "mode": "teaching" if self.teaching else "vive",
+            "teleop": bool(self.vive.control_enabled) if not self.teaching else False,
+            "recording": bool(self.recorder.is_recording),
+            "saved": int(self.saved_count),
+            "gripper": round(float(self.gripper.get_position_normalized()), 3),
+            "quit": bool(self.quit_requested),
+        }
+
+    def print_status(self):
+        s = self.snapshot()
+        teleop = "启用" if s["teleop"] else "暂停"
+        rec = "录制中" if s["recording"] else "空闲"
+        print(f"[状态] 遥控:{teleop} | {rec} | 已存 {s['saved']} 条 | "
+              f"夹爪 {int(s['gripper'] * 100)}%")
+
+
 # ============ 主程序 ============
 def main():
     parser = argparse.ArgumentParser(description='RealMan RM65 数据采集')
@@ -503,6 +716,12 @@ def main():
     parser.add_argument('--tracker-serial', type=str, default=DEFAULT_TRACKER_SERIAL,
                         help='Vive Tracker 序列号（留空或保留占位符则自动选第一个 tracker）')
     parser.add_argument('--teaching', action='store_true', help='示教模式（不用Vive）')
+    parser.add_argument('--keybindings', type=str, default=DEFAULT_KEYBINDINGS_PATH,
+                        help='按键表 JSON 路径（terminal/web 前端共用）')
+    parser.add_argument('--no-home', action='store_true',
+                        help='启动时不自动慢速归位到 ROBOT_INIT')
+    parser.add_argument('--home-countdown', type=int, default=ARM_HOME_COUNTDOWN,
+                        help='启动归位前倒计时秒数（0=不倒计时）')
     args = parser.parse_args()
 
     # 导入机械臂SDK
@@ -553,71 +772,38 @@ def main():
     # 初始化录制器
     recorder = DataRecorder(arm, arm_lock, gripper, cam_top, cam_wrist, args.fps)
 
-    print("\n" + "-" * 50)
-    if args.teaching:
-        print("命令: s=录制  d=保存  g <0-100>=夹爪  c=闭合  o=打开  q=退出")
-    else:
-        print("命令: v=校准  w=遥控  e=停止  s=录制  d=保存")
-        print("      g <0-100>=夹爪  c=闭合  o=打开  q=退出")
-    print("-" * 50)
+    # 动作层: terminal 与(后续)web 前端共用同一套命名动作
+    controller = CollectorController(
+        arm, arm_lock, gripper, vive_ctrl, recorder,
+        save_dir=args.save_dir, task_name=args.task_name, teaching=args.teaching,
+    )
+
+    # 启动慢速归位 (按要求放在 Vive 连接之后): 上电后位姿未知, 慢速求稳
+    if not args.no_home:
+        controller.move_to_init(ARM_HOME_SPEED_SLOW, block=1,
+                                countdown=max(0, args.home_countdown), label="慢速归位")
+
+    # 加载按键表 (terminal/web 共用 JSON), 据此生成命令提示与单键映射
+    bindings = load_keybindings(args.keybindings)
+    keymap = build_keymap(bindings, args.teaching)
+    print()
+    print_command_table(bindings, args.teaching)
 
     old_settings = termios.tcgetattr(sys.stdin)
-    cmd_buffer = ""
-
     try:
         tty.setcbreak(sys.stdin.fileno())
-        print("> ", end='', flush=True)
-
-        while True:
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
-            if rlist:
-                char = sys.stdin.read(1)
-                if char == '\n':
-                    cmd = cmd_buffer.strip()
-                    if cmd == 'q':
-                        print()
-                        break
-                    elif cmd == 'v' and not args.teaching:
-                        print(); vive_ctrl.calibrate()
-                    elif cmd == 'w' and not args.teaching:
-                        print(); vive_ctrl.enable()
-                    elif cmd == 'e' and not args.teaching:
-                        print(); vive_ctrl.disable()
-                    elif cmd == 's':
-                        print()
-                        filename = get_next_filename(args.save_dir, args.task_name)
-                        recorder.start(filename)
-                    elif cmd == 'd':
-                        print(); recorder.stop()
-                    elif cmd.startswith('g '):
-                        print()
-                        try:
-                            val = max(0, min(100, int(cmd.split()[1])))
-                            gripper.move_pct(val)
-                            print(f"夹爪: {val}%")
-                        except Exception:
-                            print("格式: g <0-100>")
-                    elif cmd == 'c':
-                        print()
-                        gripper.close()
-                        print("夹爪: 闭合")
-                    elif cmd == 'o':
-                        print()
-                        gripper.open()
-                        print("夹爪: 打开")
-                    elif cmd:
-                        print("\n未知命令")
-                    cmd_buffer = ""
-                    print("> ", end='', flush=True)
-                elif char == '\x7f':
-                    if cmd_buffer:
-                        cmd_buffer = cmd_buffer[:-1]
-                        sys.stdout.write('\b \b')
-                        sys.stdout.flush()
-                else:
-                    cmd_buffer += char
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
+        controller.print_status()
+        # 单键即触发: 读到一个字符立刻查表分发, 无需回车
+        while not controller.quit_requested:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not rlist:
+                continue
+            char = sys.stdin.read(1)
+            if char == '\x03':            # Ctrl+C 兜底 (cbreak 下一般已抛 KeyboardInterrupt)
+                break
+            binding = keymap.get(char) or keymap.get(char.lower())
+            if binding:
+                controller.dispatch(binding["action"], binding.get("args"))
 
     except KeyboardInterrupt:
         print("\n")

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "_comment": "采集脚本按键表 — terminal 与(后续)web 前端共用。字段: key=单键(区分大小写,建议小写); action=动作名(对应 collect_data.py 的 CollectorController.action_<name>); args=动作参数(可选); label=界面显示; modes=可选[\"vive\"|\"teaching\"],缺省表示两种模式通用。改本文件即可同时自定义两端按键。",
+  "bindings": [
+    {"key": "v", "action": "calibrate_vive", "label": "校准 Vive 零点", "modes": ["vive"]},
+    {"key": "w", "action": "toggle_teleop",  "label": "遥控 开/关",     "modes": ["vive"]},
+    {"key": "s", "action": "toggle_record",  "label": "录制 开始/保存"},
+    {"key": "h", "action": "reset_arm",      "label": "复位到起始位(常速)"},
+    {"key": "o", "action": "gripper_open",   "label": "夹爪张开"},
+    {"key": "c", "action": "gripper_close",  "label": "夹爪闭合"},
+    {"key": "1", "action": "gripper_pct", "args": {"pct": 30},  "label": "夹爪 30%"},
+    {"key": "2", "action": "gripper_pct", "args": {"pct": 60},  "label": "夹爪 60%"},
+    {"key": "3", "action": "gripper_pct", "args": {"pct": 100}, "label": "夹爪 100%"},
+    {"key": "q", "action": "quit",           "label": "退出"}
+  ]
+}

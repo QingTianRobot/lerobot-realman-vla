@@ -143,11 +143,6 @@ ROBOT_INIT_ORI = np.array([3.152, 0.149, -0.137])
 
 > ⚠️ **采集前务必先常驻启动 SteamVR**：推荐一键脚本 `bash hardware/steamvr_restart.sh`（自动清理幽灵树 + 常驻启动 + 轮询到 `vrserver` 与 `vrmonitor` 都就绪）；或手动 `steam steam://rungameid/250820`，再用 `pgrep -x vrserver && pgrep -x vrmonitor` 确认两个进程都在。采集是长任务，若靠脚本自己临时拉起 vrserver，它无 vrmonitor 撑着会在异常/退出时 `Monitor: 0` 自杀，`_control_loop` 随即读不到位姿（`pose is None` 静默 `continue`）——**机械臂中途不跟随了却仍在录制，采到废数据**。详见 [硬件配置 README「运行自检与正确启动顺序」](../hardware/README.md)。
 
-```bash
-# 清理残留 + 常驻启动完整栈 (vrserver + vrmonitor)，并等待两者同时就绪后打印确认
-bash hardware/steamvr_restart.sh
-```
-
 
 默认参数已填好你的硬件，最简形式：
 
@@ -166,35 +161,55 @@ python scripts/collect_data.py \
     --save-dir data/raw_hdf5 --task-name pick_cube --fps 30
 ```
 
-启动后逐项确认状态行：
+启动后逐项确认状态行；Vive 就绪后会**自动慢速归位到 `ROBOT_INIT`**（3 秒倒计时，请清空机械臂周围），随后打印单键命令表（无需回车）：
 
 ```
 相机: top=OK, wrist=OK
 机械臂: OK (192.168.5.123:8080)
 夹爪: OK (/dev/realman/gripper_left)
 Vive: OK
->            # 交互提示符（输入命令后按回车）
+[!] 机械臂即将慢速归位到起始位, 请清空周围! 3 秒后开始...
+    3...
+    2...
+    1...
+[✓] 慢速归位完成 (v=10%)
+--------------------------------------------------
+单键即触发 (无需回车):
+  [v] 校准 Vive 零点
+  [w] 遥控 开/关
+  [s] 录制 开始/保存
+  [h] 复位到起始位(常速)
+  [o] 夹爪张开
+  [c] 夹爪闭合
+  [1] 夹爪 30%
+  [2] 夹爪 60%
+  [3] 夹爪 100%
+  [q] 退出
+  [Ctrl+C] 强制退出
+--------------------------------------------------
+[状态] 遥控:暂停 | 空闲 | 已存 0 条 | 夹爪 0%
 ```
+
+> 命令表由 [`configs/keybindings.json`](../configs/keybindings.json) 自动生成，改该文件即可自定义按键（terminal 与后续 web 前端共用）。不想启动即归位加 `--no-home`；归位速度/倒计时见 `collect_data.py` 顶部 `ARM_HOME_*` 常量。
 
 ---
 
 ## 5. 交互命令
 
-> 输入字母/命令后**按回车**执行。
+> **单键即触发，无需回车**；按键与动作由 [`configs/keybindings.json`](../configs/keybindings.json) 定义，改该文件即可自定义（terminal 与后续 web 前端共用）。
 
-| 命令 | 功能 | 备注 |
+| 按键 | 动作 | 备注 |
 |------|------|------|
-| `v` | 校准 Vive 零点 | 保持 tracker 静止，采 30 帧平均 |
-| `w` | 启用遥控 | 机械臂开始跟随 tracker（**会动，注意安全**） |
-| `e` | 暂停遥控 | 机械臂停在原地 |
-| `s` | 开始录制一条 | 自动命名 `pick_cube_0.hdf5`、`_1`… |
-| `d` | 停止并保存 | 打印实际帧率与帧数 |
-| `g <0-100>` | 夹爪开度百分比 | **`g 0`=闭合，`g 100`=张开** |
-| `c` | 夹爪闭合 | |
-| `o` | 夹爪张开 | |
+| `v` | 校准 Vive 零点 | 保持 tracker 静止，采 30 帧平均（仅 Vive 模式） |
+| `w` | 遥控 **开/关**（toggle） | 单键切换启用/暂停；启用后机械臂跟随 tracker（**会动，注意安全**），暂停时停在原地（仅 Vive 模式） |
+| `s` | 录制 **开始/保存**（toggle） | 单键切换：开始一条（自动命名 `pick_cube_0.hdf5`、`_1`…）↔ 停止并保存（打印实际帧率与帧数） |
+| `h` | **复位** | 常速（`v=45%`）归位到 `ROBOT_INIT`；执行前自动暂停遥操，**录制中不可复位** |
+| `1`/`2`/`3` | 夹爪预设开度 | 分别 30%/60%/100%；百分比在 `keybindings.json` 的 `args.pct` 自定义 |
+| `c` | 夹爪闭合 | 等价 0% |
+| `o` | 夹爪张开 | 等价 100% |
 | `q` | 退出 | 自动松夹爪、断连、关相机 |
 
-> 机械臂位姿由 **Vive tracker** 控制，夹爪由 **键盘 `g/c/o`** 控制（tracker 不管夹爪）。
+> 机械臂位姿由 **Vive tracker** 控制，夹爪由 **键盘 `1`/`2`/`3`/`c`/`o`** 控制（tracker 不管夹爪）。
 
 ---
 
@@ -202,14 +217,14 @@ Vive: OK
 
 1. 摆好场景（物体、容器位置；每条略变化以覆盖更多状态）
 2. 手把 tracker 放到**遥操起始姿态**（对应 `ROBOT_INIT_POS`）→ 按 `v` 校准零点
-3. 按 `w` 启用 → 移动 tracker，机械臂跟随；**先空移确认方向不反**
+3. 按 `w` 启用遥控（再按一次暂停）→ 移动 tracker，机械臂跟随；**先空移确认方向不反**
 4. 把机械臂移到任务起点 → 按 `s` 开始录制
-5. 用 tracker 操控机械臂完成任务，在合适时机按 `c`（抓取）/ `o`（释放）
-6. 完成 → 按 `d` 保存
-7. 按 `e` 暂停遥控 → 复位场景 → 回到第 2 步采下一条
+5. 用 tracker 操控机械臂完成任务，在合适时机按 `c`（抓取）/ `o`（释放）/ `1`/`2`/`3`（预设开度）
+6. 完成 → 再按 `s` 停止并保存
+7. 按 `w` 暂停遥控（或按 `h` 常速复位到 `ROBOT_INIT`）→ 复位场景 → 回到第 2 步采下一条
 8. 采够条数 → 按 `q` 退出
 
-> 录制期间必须保持 `w` 启用，否则机械臂不动、录到的是静止轨迹。
+> 录制期间必须保持遥控启用（`w`），否则机械臂不动、录到的是静止轨迹。**录制中不可按 `h` 复位**（阻塞会中断采集）；`h` 复位会先自动暂停遥操，复位后需重新 `v` 校准再 `w` 启用。
 
 ### 示教模式（不用 Vive）
 
@@ -218,7 +233,7 @@ Vive: OK
 ```bash
 python scripts/collect_data.py --task-name pick_cube --fps 30 --teaching
 ```
-命令精简为：`s`=录制、`d`=保存、`g/c/o`=夹爪、`q`=退出。
+命令精简为（单键即触发）：`s`=录制开始/保存、`1`/`2`/`3`/`c`/`o`=夹爪、`h`=复位、`q`=退出。
 
 ---
 
@@ -290,11 +305,12 @@ python scripts/convert_to_lerobot.py \
 | `Vive: FAIL` | SteamVR 没开 / tracker 未追踪 / 基站没通电；无头显报 `Init_HmdNotFound` → 需配 null 假头显（见 [硬件配置 README](../hardware/README.md)）；多 tracker 用 `--tracker-serial` 指定 |
 | `game already running` | 上次退出残留了 reaper 幽灵进程树；`bash hardware/steamvr_restart.sh`（先清树再启动），或 `bash hardware/steamvr_restart.sh --kill` 只清理不启动 |
 | 按 `w` 机械臂乱跳 | `ROBOT_INIT_POS/ORI` 没标定（见 3.2） |
+| 启动/复位打印 `[!] 归位失败: rm_movej_p ret=X` | 该次归位未执行（不会乱动）；ret≠0 多为 `ROBOT_INIT` 位姿不可达/姿态不合理，用 `--read-init --write` 重标定后再试；只想跳过启动归位加 `--no-home` |
 | 机械臂方向反了 | 坐标映射符号需翻转（见 3.2b） |
 | `import pyorbbecsdk` 报 undefined symbol | 没 `source env.sh`（库路径未修） |
 | 相机 "Device is already in use" | `pkill -f realsense`；确认两相机分属不同 USB 控制器（`lsusb -t`） |
 | 夹爪使能失败 | 检查接线/从站地址(`--gripper-slave-id`)/波特率；脚本已带重试 |
-| 夹爪开合方向反 | 确认标定文件；`g 0`=闭合、`g 100`=张开 |
+| 夹爪开合方向反 | 确认标定文件；`c`=闭合(0%)、`o`=张开(100%) |
 | 腕部相机全黑 | 初始化顺序须 RealSense 先于 Orbbec（RealSense 的 `hardware_reset` 会打断 Orbbec UVC 流）；`collect_data.py` 已按此顺序，单独自检 Orbbec 时确保无 RealSense 进程在 reset |
 | 机械臂 `socket connect err` / 连接被拒 | `--arm-ip` 要是臂的 IP，别用成本机网卡 IP（本机 enp5s0 曾配成 `192.168.5.80`）；确认臂上电、TCP 8080 可达 |
 | 帧率明显低于 30 | 相机取流慢/USB 带宽不足；见 [问题排查](troubleshooting.md) |
