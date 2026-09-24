@@ -60,6 +60,8 @@ vendor/*
 
 # 夹爪行程标定 (机器/硬件相关, 由 changingtek_gripper.py --calibrate 生成)
 hardware/gripper_calibration.json
+# Pika 主手夹爪行程标定 (机器/硬件相关, 由 pika_gripper.py --calibrate 生成)
+hardware/pika_calibration.json
 
 # Jupyter
 .ipynb_checkpoints/
