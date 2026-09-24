@@ -54,6 +54,11 @@ GRIPPER_PORT = "/dev/realman/gripper_left"
 GRIPPER_SLAVE_ID = 2          # 知行夹爪 Modbus 从站地址
 GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准
+# 夹爪复位开度 (归一化 0~1, 1=张开): 机械臂归位到 ROBOT_INIT 后把夹爪也归到此状态,
+# 保证每条 episode 都从一致的「机械臂起始位 + 夹爪张开」开始 (抓取任务的自然起点)。
+GRIPPER_RESET_VALUE = 1.0
+GRIPPER_RESET_TOL = 0.05      # 复位等待到位的归一化容差: 反馈与目标偏差<此值即视为到位
+GRIPPER_RESET_TIMEOUT = 3.0   # 复位等待到位超时(秒): 超时仅告警, 不阻塞后续操作
 
 # Pika Sense 主手夹爪 (可选第二套夹爪控制源, 与键盘互斥; 需 --pika-gripper 启用)
 PIKA_GRIPPER_PORT = "/dev/tty_pika_left"   # 见 /etc/udev/rules.d/98-usb-serial.rules 的 PIKA_LEFT
@@ -844,7 +849,8 @@ class CollectorController:
             pass
         return None
 
-    def move_to_init(self, speed, block=1, countdown=0, label="归位", skip_if_near=False):
+    def move_to_init(self, speed, block=1, countdown=0, label="归位", skip_if_near=False,
+                     reset_gripper=True):
         """rm_movej_p 关节空间规划到 ROBOT_INIT (大位移最稳、不撞奇异点)。
 
         机械臂全程处于真实模式(run_mode=1), 规划运动直接执行即可 —— 切勿切到
@@ -852,6 +858,8 @@ class CollectorController:
         失败仅打印告警、不下发危险运动; ret!=0 多为位姿不可达, 见 ROBOT_INIT 标定。
         skip_if_near=True: 若已在 ROBOT_INIT 附近(位置<ARM_HOME_POS_TOL 且姿态<ARM_HOME_ORI_TOL),
         直接跳过、不下发运动 —— 供启动慢速归位用, 免得每次重启都无谓地慢速跑一遍。
+        reset_gripper=True: 机械臂到位(或已在附近而跳过运动)后把夹爪也复位到 GRIPPER_RESET_VALUE,
+        保证机械臂与夹爪同时回到一致的起始状态。
         """
         if skip_if_near:
             cur = self._read_arm_pose()
@@ -859,6 +867,9 @@ class CollectorController:
                 dp, dang = _pose_deviation(cur, self.robot_init_pose)
                 if dp < ARM_HOME_POS_TOL and dang < ARM_HOME_ORI_TOL:
                     print(f"[i] 已在起始位附近 (位置 {dp * 100:.1f}cm / 姿态 {np.degrees(dang):.1f}°), 跳过{label}")
+                    # 即便跳过机械臂运动, 仍复位夹爪, 保证起始状态一致
+                    if reset_gripper:
+                        self.reset_gripper()
                     return True
         if countdown > 0:
             print(f"[!] 机械臂即将{label}到起始位, 请清空周围! {countdown} 秒后开始...")
@@ -875,8 +886,31 @@ class CollectorController:
             return False
         if block:
             self._wait_until_arrived(label)
+        # 机械臂到位后再复位夹爪: 两者依次回到起始状态, 避免夹爪先张开时机械臂还在大幅运动
+        if reset_gripper:
+            self.reset_gripper()
         print(f"[✓] {label}完成 (v={speed}%)")
         return True
+
+    def reset_gripper(self, value=GRIPPER_RESET_VALUE, wait=True,
+                      tol=GRIPPER_RESET_TOL, timeout=GRIPPER_RESET_TIMEOUT):
+        """把夹爪归位到固定开度(默认 GRIPPER_RESET_VALUE=张开), 与机械臂归位配套。
+
+        move_normalized 异步下发, 夹爪按自身 speed_pct 平滑运动(非瞬间传送);
+        wait=True 时轮询反馈直到接近目标或超时, 避免后续遥操/录制读到未到位的中间值。
+        超时仅告警、不阻塞。
+        """
+        self.gripper.move_normalized(value)
+        if not wait:
+            return
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if abs(self.gripper.get_position_normalized() - value) <= tol:
+                print(f"[✓] 夹爪复位到 {int(value * 100)}%")
+                return
+            time.sleep(0.05)
+        print(f"[!] 夹爪复位等待到位超时 ({timeout:.0f}s): 可能未使能/总线抖动, 当前 "
+              f"{int(self.gripper.get_position_normalized() * 100)}%")
 
     def _wait_until_arrived(self, label, timeout=60.0, poll=0.05):
         """轮询等待机械臂到达 ROBOT_INIT (配合非阻塞 movej_p 使用)。
