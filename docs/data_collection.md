@@ -72,7 +72,17 @@ python hardware/realsense_camera.py --serial 262322074840
 
 ### 2.4 Vive Tracker
 
-启动 **SteamVR**（`steam steam://rungameid/250820`），确认基站通电、tracker 在线。可单独自检：
+**推荐用一键脚本启动 SteamVR**（清理幽灵进程树 → 常驻启动完整栈 → 轮询等待 `vrserver`+`vrmonitor` 就绪），需在**宿主机终端**执行（沙箱内看不到宿主机进程）：
+
+```bash
+# 清理残留 + 常驻启动完整栈 (vrserver + vrmonitor)，就绪后打印确认
+bash hardware/steamvr_restart.sh
+
+# 只清理幽灵进程树，不启动（上次退出残留导致 `game already running` 时用）
+bash hardware/steamvr_restart.sh --kill
+```
+
+栈就绪后确认基站通电、tracker 在线，可单独自检：
 
 ```bash
 python hardware/vive_tracker.py   # 打印发现的设备(hmd/tracker/基站)与实时位姿
@@ -82,7 +92,7 @@ python hardware/vive_tracker.py   # 打印发现的设备(hmd/tracker/基站)与
 
 > **无头显**（只有 Tracker）时，SteamVR 默认要求 HMD，`vive_tracker.py` 会报 `Init_HmdNotFound`；需配置 null 假头显驱动后才能无头显追踪，详见 [硬件配置 README 的「无头显运行」](../hardware/README.md)。
 >
-> **先启动 SteamVR 再跑脚本**：若直接跑 `vive_tracker.py`，`openvr.init` 会自己临时拉起 vrserver，脚本一退它就因 `Monitor: 0` 自杀，下次再跑冷启动来不及就绪而报 `No tracker found`（“第一次找得到、退出后找不到”）。正确顺序见 README「运行自检与正确启动顺序」。
+> **先启动 SteamVR 再跑脚本**：若直接跑 `vive_tracker.py`，`openvr.init` 会自己临时拉起 vrserver，脚本一退它就因 `Monitor: 0` 自杀，下次再跑冷启动来不及就绪而报 `No tracker found`（“第一次找得到、退出后找不到”）。一键脚本已固化正确启动顺序；手动 fallback（`steam steam://rungameid/250820`）见 README「运行自检与正确启动顺序」。
 
 ---
 
@@ -131,7 +141,13 @@ ROBOT_INIT_ORI = np.array([3.152, 0.149, -0.137])
 
 ## 4. 启动采集
 
-> ⚠️ **采集前务必先常驻启动 SteamVR**：`steam steam://rungameid/250820`，再用 `pgrep -x vrserver && pgrep -x vrmonitor` 确认两个进程都在。采集是长任务，若靠脚本自己临时拉起 vrserver，它无 vrmonitor 撑着会在异常/退出时 `Monitor: 0` 自杀，`_control_loop` 随即读不到位姿（`pose is None` 静默 `continue`）——**机械臂中途不跟随了却仍在录制，采到废数据**。详见 [硬件配置 README「运行自检与正确启动顺序」](../hardware/README.md)。
+> ⚠️ **采集前务必先常驻启动 SteamVR**：推荐一键脚本 `bash hardware/steamvr_restart.sh`（自动清理幽灵树 + 常驻启动 + 轮询到 `vrserver` 与 `vrmonitor` 都就绪）；或手动 `steam steam://rungameid/250820`，再用 `pgrep -x vrserver && pgrep -x vrmonitor` 确认两个进程都在。采集是长任务，若靠脚本自己临时拉起 vrserver，它无 vrmonitor 撑着会在异常/退出时 `Monitor: 0` 自杀，`_control_loop` 随即读不到位姿（`pose is None` 静默 `continue`）——**机械臂中途不跟随了却仍在录制，采到废数据**。详见 [硬件配置 README「运行自检与正确启动顺序」](../hardware/README.md)。
+
+```bash
+# 清理残留 + 常驻启动完整栈 (vrserver + vrmonitor)，并等待两者同时就绪后打印确认
+bash hardware/steamvr_restart.sh
+```
+
 
 默认参数已填好你的硬件，最简形式：
 
@@ -272,6 +288,7 @@ python scripts/convert_to_lerobot.py \
 | 现象 | 排查 |
 |------|------|
 | `Vive: FAIL` | SteamVR 没开 / tracker 未追踪 / 基站没通电；无头显报 `Init_HmdNotFound` → 需配 null 假头显（见 [硬件配置 README](../hardware/README.md)）；多 tracker 用 `--tracker-serial` 指定 |
+| `game already running` | 上次退出残留了 reaper 幽灵进程树；`bash hardware/steamvr_restart.sh`（先清树再启动），或 `bash hardware/steamvr_restart.sh --kill` 只清理不启动 |
 | 按 `w` 机械臂乱跳 | `ROBOT_INIT_POS/ORI` 没标定（见 3.2） |
 | 机械臂方向反了 | 坐标映射符号需翻转（见 3.2b） |
 | `import pyorbbecsdk` 报 undefined symbol | 没 `source env.sh`（库路径未修） |
