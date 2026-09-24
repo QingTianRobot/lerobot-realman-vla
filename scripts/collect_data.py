@@ -54,6 +54,13 @@ GRIPPER_PORT = "/dev/realman/gripper_left"
 GRIPPER_SLAVE_ID = 2          # 知行夹爪 Modbus 从站地址
 GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准
+# 夹爪电机行程速度 (0~100, 占最大速度百分比): 直接决定开合快慢 —— 旧默认 50 手感偏"慢",
+# 提到 100(=官方 SDK temp_move 默认)让键盘/推理的张开-闭合更跟手; 夹持力由 force_pct 独立
+# 限制, 提速不增大夹持力。嫌太猛可下调 (采集与推理务必用同一值, 否则开合动态与训练数据不一致)。
+GRIPPER_SPEED_PCT = 100
+# 夹爪 RS-485 总线轮询频率(Hz): 决定异步命令(move_normalized→request_move)最长排队时延(1/hz)。
+# 本机 CH341/USB 总线有抖动史, 过高会加剧 CRC/丢帧, 故保守取 25; 命令排队(≤40ms)非主要延迟。
+GRIPPER_POLL_HZ = 25
 # 夹爪复位开度 (归一化 0~1, 1=张开): 机械臂归位到 ROBOT_INIT 后把夹爪也归到此状态,
 # 保证每条 episode 都从一致的「机械臂起始位 + 夹爪张开」开始 (抓取任务的自然起点)。
 GRIPPER_RESET_VALUE = 1.0
@@ -64,9 +71,10 @@ GRIPPER_RESET_TIMEOUT = 3.0   # 复位等待到位超时(秒): 超时仅告警, 
 PIKA_GRIPPER_PORT = "/dev/tty_pika_left"   # 见 /etc/udev/rules.d/98-usb-serial.rules 的 PIKA_LEFT
 PIKA_TELEOP_HZ = 30          # 主手→从手映射下发频率(Hz); 从手 move_normalized 异步覆盖式下发, 总线按其 poll_hz 消费
 PIKA_TELEOP_DEADBAND = 0.02  # 归一化死区: 变化<此值不重复下发, 减少知行 RTU 总线写入
-# 从手逼近主手的归一化限速 (单位/秒): 全程 0→1 约 1/rate 秒。把「engage 瞬间从手立即对齐
-# 主手当前开合」的突跳摊成一段平滑斜坡 (刚开启遥操时以从手当前实际位置为起点逐步逼近),
-# 正常跟随时也起限速平滑作用。≤0 关闭限速 (退回原来的瞬间对齐)。
+# 从手逼近主手的归一化限速 (单位/秒): 全程 0→1 约 1/rate 秒。【仅作用于刚 engage 的追赶阶段】——
+# 把「engage 瞬间从手立即对齐主手当前开合」的突跳摊成平滑斜坡 (以从手当前实际位置为起点逐步逼近);
+# 一旦追上主手即转为直接 1:1 跟随, 不再限速 → 消除正常操作时的"黏滞/跟不上手"滞后。
+# ≤0 关闭限速 (engage 时也直接瞬间对齐)。
 PIKA_TELEOP_RAMP_RATE = 2.5
 
 # 机械臂初始位姿（Vive遥操作零点对应的机械臂笛卡尔位姿）
@@ -583,9 +591,10 @@ class PikaGripperTeleop:
     (move_normalized 异步覆盖式下发, 由知行总线线程按 poll_hz 消费); 变化小于 deadband
     不重复下发, 减少 RTU 总线写入。即: 按 w 开启遥操→夹爪跟随主手, 暂停遥操→夹爪停写。
 
-    限速斜坡(ramp_rate): 刚 engage 时从手与主手开度往往不一致, 若直接对齐会造成夹爪
-    瞬间突跳(可能夹手/撞到物体、并在录制里留下一段快变)。故开启遥操时以从手当前
-    实际位置为起点, 每步最多变化 ramp_rate/hz 逐步逼近主手, 把突跳摊成平滑斜坡。
+    限速斜坡(ramp_rate): 【仅用于刚 engage 的追赶阶段】—— 此时从手与主手开度往往不一致,
+    若直接对齐会造成夹爪瞬间突跳(可能夹手/撞到物体、并在录制里留下一段快变)。故 engage 时
+    以从手当前实际位置为起点, 每步最多变化 ramp_rate/hz 逐步逼近主手, 把突跳摊成平滑斜坡;
+    一旦追上主手即转入【直接 1:1 跟随】(不再限速), 消除正常操作时的跟随滞后。
 
     teleop_gate: 无参可调用返回 bool, 判断机械臂遥操是否开启; None 表示不门控(如示教模式)。
     """
@@ -602,13 +611,15 @@ class PikaGripperTeleop:
         self.enabled = False       # 仅在被设为当前夹爪控制源时写从手
         self.running = True
         self._cmd_v = None         # 限速斜坡的当前指令值(归一化); None=尚未 engage
+        self._catching_up = False  # True=engage 后正限速追赶主手; 追上后置 False 转直接跟随
         self._last_sent = None     # 上一次真正下发到总线的值 (死区判断用)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def _loop(self):
         interval = 1.0 / self.hz
-        # 每步最大变化量: 全程 0→1 需 1/ramp_rate 秒; ramp_rate≤0 时不限速(直接对齐主手)
+        # engage 追赶阶段每步最大变化量: 全程 0→1 需 1/ramp_rate 秒; ramp_rate≤0 时不限速。
+        # 仅用于「刚 engage 追赶主手」, 追上后转直接 1:1 跟随(见 _catching_up), 不再限速。
         max_step = self.ramp_rate * interval if self.ramp_rate > 0 else None
         last_err = None
         while self.running:
@@ -618,6 +629,7 @@ class PikaGripperTeleop:
             if not self.enabled or not gate_open:
                 # 未接管/遥操暂停: 清斜坡状态; 下次 engage 从从手「当前实际位置」起步平滑对齐, 不突跳
                 self._cmd_v = None
+                self._catching_up = False
                 self._last_sent = None
                 continue
             try:
@@ -627,13 +639,17 @@ class PikaGripperTeleop:
                 if self._cmd_v is None:
                     # 刚 engage: 以从手当前反馈位置为斜坡起点 (而非直接跳到主手值), 消除瞬间突跳
                     self._cmd_v = self.gripper.get_position_normalized()
-                if max_step is not None:
+                    self._catching_up = True
+                if self._catching_up and max_step is not None:
+                    # 追赶阶段: 限速逐步逼近主手, 把 engage 突跳摊成平滑斜坡 (防夹手/撞物)
                     delta = target - self._cmd_v
                     if abs(delta) <= max_step:
                         self._cmd_v = target
+                        self._catching_up = False   # 已追上主手 → 转入直接跟随, 此后不再限速
                     else:
                         self._cmd_v += math.copysign(max_step, delta)
                 else:
+                    # 已追上(或未启用限速): 直接 1:1 跟随主手, 不做人为限速 → 消除跟随滞后
                     self._cmd_v = target
                 # 死区: 与上次下发值变化过小则不重复写 RTU 总线
                 if self._last_sent is not None and abs(self._cmd_v - self._last_sent) < self.deadband:
@@ -1100,6 +1116,11 @@ def main():
     parser.add_argument('--cam-wrist', type=str, default=DEFAULT_CAM_WRIST_SERIAL, help='腕部相机(Orbbec 305)序列号，留空取第一个设备')
     parser.add_argument('--gripper-port', type=str, default=GRIPPER_PORT, help='知行夹爪串口')
     parser.add_argument('--gripper-slave-id', type=int, default=GRIPPER_SLAVE_ID, help='知行夹爪 Modbus 从站地址')
+    parser.add_argument('--gripper-speed', type=int, default=GRIPPER_SPEED_PCT,
+                        help='夹爪电机行程速度(0~100, 越大开合越快; 夹持力由 force_pct 独立限制, 提速不增力), '
+                             '默认 %(default)s; 嫌太猛可下调 (须与推理端一致)')
+    parser.add_argument('--gripper-poll-hz', type=float, default=GRIPPER_POLL_HZ,
+                        help='夹爪 RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz; 本机总线有抖动不宜过高, 默认 %(default)s')
     parser.add_argument('--pika-gripper', action=argparse.BooleanOptionalAction, default=True,
                         help='启用 Pika Sense 主手夹爪作为首选夹爪控制源(与键盘互斥, 按 p 切换); 默认开, --no-pika-gripper 关')
     parser.add_argument('--pika-port', type=str, default=PIKA_GRIPPER_PORT,
@@ -1163,6 +1184,7 @@ def main():
     gripper = ChangingtekGripper(
         port=args.gripper_port, slave_id=args.gripper_slave_id,
         baudrate=GRIPPER_BAUDRATE, max_position=GRIPPER_MAX_POSITION,
+        speed_pct=args.gripper_speed, poll_hz=args.gripper_poll_hz,
     )
     gripper.connect()
     print(f"夹爪: {'OK' if gripper.connected else 'FAIL'} ({args.gripper_port})")

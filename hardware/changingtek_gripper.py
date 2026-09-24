@@ -50,7 +50,7 @@ class ChangingtekGripper:
 
     def __init__(self, port="/dev/realman/gripper_left", slave_id=2,
                  baudrate=115200, min_position=0, max_position=9000,
-                 name="left", poll_hz=25, speed_pct=50, force_pct=60,
+                 name="left", poll_hz=25, speed_pct=100, force_pct=60,
                  calibration_file=None, use_calibration=True, invert=True):
         self.port = port
         self.slave_id = int(slave_id)
@@ -329,6 +329,8 @@ if __name__ == "__main__":
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--max-position", type=int, default=9000)
     parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument("--speed", type=int, default=100,
+                        help="电机行程速度(0~100, 越大开合越快; 夹持力由 force_pct 独立限制), 默认 %(default)s")
     parser.add_argument("--calibrate", action="store_true",
                         help="驱动到开/合机械限位实测行程, 持久化标定到 gripper_calibration.json")
     parser.add_argument("--margin", type=float, default=0.02,
@@ -339,6 +341,7 @@ if __name__ == "__main__":
 
     g = ChangingtekGripper(port=args.port, slave_id=args.slave_id,
                            baudrate=args.baudrate, max_position=args.max_position,
+                           speed_pct=args.speed,
                            use_calibration=not args.no_calibration_file)
     print("连接:", g.connect())
     if not g.connected:

@@ -51,6 +51,8 @@ GRIPPER_PORT = "/dev/realman/gripper_left"
 GRIPPER_SLAVE_ID = 2          # 知行夹爪 Modbus 从站地址
 GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准 (需与采集时一致)
+GRIPPER_SPEED_PCT = 100       # 电机行程速度(0~100); ⚠ 必须与采集端(collect_data --gripper-speed)一致, 否则开合动态与训练数据不符
+GRIPPER_POLL_HZ = 25          # RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz
 
 # 训练数据典型起始位姿（根据你的数据修改）
 INIT_POSE = np.array([-15.0, 3.0, 89.0, 0.5, 86.0, -15.0, 1.0], dtype=np.float32)
@@ -262,6 +264,10 @@ def main():
     parser.add_argument('--cam-wrist', type=str, default=DEFAULT_CAM_WRIST_SERIAL, help='腕部相机(Orbbec 305)序列号，留空取第一个设备')
     parser.add_argument('--gripper-port', type=str, default=GRIPPER_PORT, help='知行夹爪串口')
     parser.add_argument('--gripper-slave-id', type=int, default=GRIPPER_SLAVE_ID, help='知行夹爪 Modbus 从站地址')
+    parser.add_argument('--gripper-speed', type=int, default=GRIPPER_SPEED_PCT,
+                        help='夹爪电机行程速度(0~100, 越大开合越快), 应与采集时一致, 默认 %(default)s')
+    parser.add_argument('--gripper-poll-hz', type=float, default=GRIPPER_POLL_HZ,
+                        help='夹爪 RS-485 总线轮询频率(Hz), 默认 %(default)s')
     parser.add_argument('--freq', type=float, default=15.0,
                         help='控制频率(Hz)，应与训练数据fps一致')
     parser.add_argument('--task', type=str, default='pick up the cube',
@@ -315,6 +321,7 @@ def main():
     gripper = ChangingtekGripper(
         port=args.gripper_port, slave_id=args.gripper_slave_id,
         baudrate=GRIPPER_BAUDRATE, max_position=GRIPPER_MAX_POSITION,
+        speed_pct=args.gripper_speed, poll_hz=args.gripper_poll_hz,
     )
     gripper.connect()
     print(f"      夹爪: {'OK' if gripper.connected else 'FAIL'} ({args.gripper_port})")
