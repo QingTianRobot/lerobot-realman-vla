@@ -34,6 +34,8 @@ import termios
 import time
 import math
 import threading
+import queue
+import contextlib
 import sys
 import os
 import json
@@ -706,11 +708,12 @@ class DataRecorder:
         print(f"录制开始: {os.path.basename(filename)} (目标 {self.target_fps}Hz)")
 
     def stop(self):
+        """停止录制并落盘; 返回保存成功的 HDF5 路径 (无数据/保存失败返回 None)。"""
         if not self.is_recording:
-            return
+            return None
         self.is_recording = False
         self.thread.join()
-        self._save()
+        return self._save()
 
     def _record_loop(self):
         interval = 1.0 / self.target_fps
@@ -751,7 +754,7 @@ class DataRecorder:
     def _save(self):
         if not self.data_buffer['qpos']:
             print(" >> 无数据")
-            return
+            return None
 
         qpos = self.data_buffer['qpos']
         # 行为克隆标签: action[t] = qpos[t+1]
@@ -780,8 +783,191 @@ class DataRecorder:
                                  data=np.array(self.data_buffer['images_wrist']),
                                  compression="lzf", chunks=True)
             print(f"保存: {os.path.basename(self.filename)} ({len(qpos)} frames)")
+            return self.filename
         except Exception as e:
             print(f"[!] 保存失败: {e}")
+            return None
+
+
+# ============ 异步 LeRobot 转换模块 ============
+@contextlib.contextmanager
+def _suppress_native_stderr():
+    """视频编码期间把进程级 stderr(fd 2) 重定向到 devnull, 压掉 libx264/ffmpeg 的
+    INFO 统计噪声(形如 "[libx264 @ 0x..] i4 v,h,dc...")。
+
+    为何用 fd 级 dup2 而非 logging/av.logging 设级:
+      · 这些噪声由原生 libx264 直接写 fd 2, 绕过 Python logging;
+      · LeRobot encode_video_frames 结尾会 restore_default_callback() 把 av.logging 设置冲掉,
+        且双相机时编码在 fork 出的子进程里跑 —— 子进程继承父进程 fd 2,
+        故在父进程 dup2 才能连同子进程的噪声一并静音。退出时恢复原 stderr。
+    """
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    try:
+        with open(os.devnull, 'w') as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+
+
+class LeRobotAsyncConverter:
+    """后台单工作线程: 把采集保存的 HDF5 逐条异步转成 LeRobot 数据集。
+
+    语义: 数据集不存在→LeRobotDataset.create 新建; 已存在(有 meta/info.json)→载入后
+    追加一条 episode (LeRobot 0.4.x 的 _save_episode_data 原生支持 resume: 重新载入时
+    latest_episode is None 会从 meta.episodes[-1] 算出下一个 chunk/file 索引, 不覆盖)。
+    每条: add_frame → save_episode → finalize; 完成后按约定删除原始 HDF5。
+
+    为何单线程串行: LeRobotDataset 非线程安全(add_frame/save_episode 不能并发),
+    且多条 episode 并发追加会争抢 episode_index; 故用一个 FIFO 队列 + 单工作线程。
+    视频编码在 Linux 下 save_episode 内部已用 ProcessPoolExecutor 并行(2 相机),
+    且 h264 编码释 GIL, 因此采集主循环只做入队, 不被转换阻塞。
+
+    颜色: HDF5 存的是相机 get_frame() 的 BGR, 而 LeRobot 走 PIL(按 RGB 解释),
+    直接传会红蓝互换; 故每帧 cv2.cvtColor(BGR2RGB), 与 convert_to_lerobot.py / inference.py 一致。
+    """
+
+    def __init__(self, lerobot_dir, repo_id, fps, task, vcodec="h264",
+                 image_writer_processes=4, image_writer_threads=4, delete_hdf5=True):
+        # 惰性导入: 仅在启用自动转换时引入 torch/lerobot, 不拖慢常规采集启动
+        import torch
+        from PIL import Image
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        self._torch = torch
+        self._Image = Image
+        self._LeRobotDataset = LeRobotDataset
+
+        self.root = str(lerobot_dir)
+        self.repo_id = repo_id
+        self.fps = int(fps)
+        self.task = task
+        self.vcodec = vcodec
+        self.image_writer_processes = image_writer_processes
+        self.image_writer_threads = image_writer_threads
+        self.delete_hdf5 = delete_hdf5
+
+        self._queue = queue.Queue()
+        self.converted = 0
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def enqueue(self, hdf5_path):
+        """入队一条已保存的 HDF5, 交由后台线程转换 (不阻塞调用方)。"""
+        self._queue.put(hdf5_path)
+        print(f"[转换] 已入队后台转换: {os.path.basename(hdf5_path)} → {self.root}")
+
+    def _loop(self):
+        while True:
+            item = self._queue.get()          # 阻塞等待; shutdown 会 put(None) 解阻
+            if item is None:
+                break
+            ok = False
+            try:
+                self._convert_one(item)
+                self.converted += 1
+                ok = True
+            except Exception as e:  # noqa: BLE001 - 单条转换失败不应中断整个队列
+                print(f"[!] 转换失败 {os.path.basename(item)}: {e}")
+            finally:
+                # 按约定总是删除 HDF5 (中间载体, 转完即删); 失败时仍删, 上方已告警
+                if self.delete_hdf5:
+                    try:
+                        os.remove(item)
+                        print(f"[转换] 已删除 HDF5: {os.path.basename(item)}"
+                              + ("" if ok else " (⚠ 转换未成功仍按约定删除)"))
+                    except OSError:
+                        pass
+
+    def _read_hdf5(self, path):
+        with h5py.File(path, 'r') as f:
+            data = {
+                'qpos': np.array(f['observations/qpos']),                              # (N,7)
+                'action': np.array(f['action']),                                       # (N,7)
+                'camera_global': np.array(f['observations/images/camera_global']),      # (N,H,W,3) BGR
+                'camera_left': np.array(f['observations/images/camera_left']),          # (N,H,W,3) BGR
+            }
+            # 末端位姿可选: 旧 HDF5 没有则跳过, 向后兼容
+            if 'observations/ee_pose' in f:
+                data['ee_pose'] = np.array(f['observations/ee_pose'])                  # (N,6)
+        return data
+
+    def _build_features(self, data):
+        state_dim = data['qpos'].shape[1]
+        action_dim = data['action'].shape[1]
+        img_h, img_w = data['camera_global'].shape[1:3]
+        joint_names = ["joint_1", "joint_2", "joint_3", "joint_4",
+                       "joint_5", "joint_6", "gripper"]
+        features = {
+            "observation.state": {"dtype": "float32", "shape": (state_dim,), "names": joint_names},
+            "observation.images.camera_global": {
+                "dtype": "video", "shape": (img_h, img_w, 3),
+                "names": ["height", "width", "channels"]},
+            "observation.images.camera_left": {
+                "dtype": "video", "shape": (img_h, img_w, 3),
+                "names": ["height", "width", "channels"]},
+            "action": {"dtype": "float32", "shape": (action_dim,), "names": joint_names},
+        }
+        # ee_pose 作为独立观测字段(切勿拼进 state, 会改维度破坏训练); 仅当 HDF5 含时才声明
+        if 'ee_pose' in data:
+            features["observation.ee_pose"] = {
+                "dtype": "float32", "shape": (6,), "names": ["x", "y", "z", "rx", "ry", "rz"]}
+        return features
+
+    def _open_dataset(self, data):
+        """数据集不存在则 create, 存在则载入以便 resume 追加。"""
+        info_json = os.path.join(self.root, "meta", "info.json")
+        if os.path.exists(info_json):
+            return self._LeRobotDataset(repo_id=self.repo_id, root=self.root, vcodec=self.vcodec)
+        return self._LeRobotDataset.create(
+            repo_id=self.repo_id, fps=self.fps, features=self._build_features(data),
+            root=self.root, robot_type="realman", use_videos=True,
+            vcodec=self.vcodec,   # AV1(libsvtav1) CPU 密集且慢数倍, 训练用 h264 足够
+            image_writer_processes=self.image_writer_processes,
+            image_writer_threads=self.image_writer_threads,
+        )
+
+    def _convert_one(self, hdf5_path):
+        data = self._read_hdf5(hdf5_path)
+        n = len(data['qpos'])
+        if n == 0:
+            print(f"[!] {os.path.basename(hdf5_path)} 无帧, 跳过")
+            return
+        has_ee = 'ee_pose' in data
+        ds = self._open_dataset(data)
+        torch, Image = self._torch, self._Image
+        for i in range(n):
+            frame = {
+                "observation.state": torch.from_numpy(data['qpos'][i].astype(np.float32)),
+                "observation.images.camera_global": Image.fromarray(
+                    cv2.cvtColor(data['camera_global'][i], cv2.COLOR_BGR2RGB)),
+                "observation.images.camera_left": Image.fromarray(
+                    cv2.cvtColor(data['camera_left'][i], cv2.COLOR_BGR2RGB)),
+                "action": torch.from_numpy(data['action'][i].astype(np.float32)),
+                "task": self.task,
+            }
+            if has_ee:
+                frame["observation.ee_pose"] = torch.from_numpy(
+                    data['ee_pose'][i].astype(np.float32))
+            ds.add_frame(frame)
+        # 编码期间静音原生 stderr, 压掉 libx264/ffmpeg 的 INFO 统计噪声(见 _suppress_native_stderr)
+        with _suppress_native_stderr():
+            ds.save_episode()
+        # 0.4.x 必须 finalize() 写 parquet footer, 否则数据集无效、无法载入 (非 0.3.x 的 consolidate)
+        ds.finalize()
+        print(f"[转换] {os.path.basename(hdf5_path)} → episode 完成 ({n} 帧); "
+              f"数据集累计 {ds.num_episodes} 条 / {ds.meta.total_frames} 帧")
+
+    def shutdown(self):
+        """排空队列: 发送哨兵并等工作线程把剩余 episode 全部转完再退出。"""
+        pending = self._queue.qsize()
+        if pending:
+            print(f"[转换] 退出前等待后台队列排空 ({pending} 条待转)...")
+        self._queue.put(None)
+        self.thread.join()
+        print(f"[转换] 已全部完成, 本次累计转换 {self.converted} 条 → {self.root}")
 
 
 # ============ 按键表 (terminal / web 前端共用) ============
@@ -856,7 +1042,7 @@ class CollectorController:
     _ACTION_PREFIX = "action_"
 
     def __init__(self, arm, arm_lock, gripper, vive_ctrl, recorder,
-                 save_dir, task_name, teaching=False, pika_teleop=None):
+                 save_dir, task_name, teaching=False, pika_teleop=None, converter=None):
         self.arm = arm
         self.arm_lock = arm_lock
         self.gripper = gripper
@@ -865,6 +1051,8 @@ class CollectorController:
         self.save_dir = save_dir
         self.task_name = task_name
         self.teaching = teaching
+        # 异步 LeRobot 转换器 (未启用自动转换时为 None); 每条 episode 保存后入队后台转换
+        self.converter = converter
         # Pika 主手夹爪遥操线程 (未启用时为 None)
         self.pika_teleop = pika_teleop
         # 夹爪控制源: pika | keyboard, 二者互斥, 由 toggle_gripper_source 切换。
@@ -1002,8 +1190,11 @@ class CollectorController:
             teleop_was_on = not self.teaching and self.vive.control_enabled
             if teleop_was_on:
                 self.vive.disable()
-            self.recorder.stop()
+            saved = self.recorder.stop()
             self.saved_count += 1
+            # 保存成功且启用了自动转换: 入队后台异步转 LeRobot (不阻塞; 转完删除 HDF5)
+            if saved and self.converter is not None:
+                self.converter.enqueue(saved)
             if teleop_was_on:
                 print("[i] 录制结束已保存, 遥操已自动暂停 (下条按 w 重新启用)")
         else:
@@ -1155,6 +1346,22 @@ def main():
                         help='One Euro 零速截止频率(Hz)，越低越压静止手抖(慢速滞后略增)，默认 %(default)s')
     parser.add_argument('--oe-beta', type=float, default=VIVE_OE_BETA,
                         help='One Euro 速度系数，越大快速运动越跟手；默认 %(default)s(刻意低=重阻尼防跟随太快)，嫌拖调大(经验10~30)')
+    # ---- 异步转 LeRobot (采完每条 episode 后台转成数据集, 没有则新建/有则 resume 追加) ----
+    parser.add_argument('--auto-convert', action=argparse.BooleanOptionalAction, default=True,
+                        help='每条 episode 保存后异步转成 LeRobot 数据集(不存在则新建, 存在则 resume 追加), 转完删除 HDF5; 默认开, --no-auto-convert 关(仅留 HDF5)')
+    parser.add_argument('--lerobot-dir', type=str, default=None,
+                        help='LeRobot 数据集输出目录(默认 data/datasets/<task_name>_lerobot)')
+    parser.add_argument('--repo-id', type=str, default=None,
+                        help='LeRobot 数据集 repo-id(默认 realman/<task_name>)')
+    parser.add_argument('--task', type=str, default='pick up the cube and place it in the basket',
+                        help='任务描述(VLA 训练/推理需完全一致), 默认 %(default)s')
+    parser.add_argument('--vcodec', type=str, default='h264',
+                        choices=['h264', 'hevc', 'libsvtav1'],
+                        help='LeRobot 视频编码器(默认 h264; 比 LeRobot 默认的 libsvtav1/AV1 快数倍)')
+    parser.add_argument('--image-writer-processes', type=int, default=4,
+                        help='转 LeRobot 时并行写 PNG 帧的进程数(0=串行), 默认 %(default)s')
+    parser.add_argument('--image-writer-threads', type=int, default=4,
+                        help='转 LeRobot 时并行写 PNG 帧的线程数(0=串行), 默认 %(default)s')
     args = parser.parse_args()
 
     # 导入机械臂SDK
@@ -1213,6 +1420,23 @@ def main():
     # 初始化录制器
     recorder = DataRecorder(arm, arm_lock, gripper, cam_top, cam_wrist, args.fps)
 
+    # 异步 LeRobot 转换器: 每条 episode 保存后后台转成数据集(没有则新建/有则 resume 追加), 转完删 HDF5。
+    # 惰性: 仅在 --auto-convert 时引入 torch/lerobot; 初始化失败不阻断采集(退回仅存 HDF5)。
+    converter = None
+    if args.auto_convert:
+        lerobot_dir = args.lerobot_dir or os.path.join('data', 'datasets', f'{args.task_name}_lerobot')
+        repo_id = args.repo_id or f'realman/{args.task_name}'
+        try:
+            converter = LeRobotAsyncConverter(
+                lerobot_dir=lerobot_dir, repo_id=repo_id, fps=args.fps, task=args.task,
+                vcodec=args.vcodec,
+                image_writer_processes=args.image_writer_processes,
+                image_writer_threads=args.image_writer_threads)
+            print(f"自动转换: 开 → {lerobot_dir} (repo-id {repo_id}, fps {args.fps}, vcodec {args.vcodec})")
+        except Exception as e:  # noqa: BLE001 - 转换不可用不应阻断采集
+            print(f"[!] 自动转换初始化失败({e}), 本次仅保存 HDF5")
+            converter = None
+
     # 可选: Pika Sense 主手夹爪 (首选夹爪控制源, 与键盘互斥; 默认开启)
     # 惰性导入: 仅在启用时才引入 vendor/pika_sdk, 未 clone submodule 也不影响常规采集。
     pika_master = None
@@ -1241,7 +1465,7 @@ def main():
     controller = CollectorController(
         arm, arm_lock, gripper, vive_ctrl, recorder,
         save_dir=args.save_dir, task_name=args.task_name, teaching=args.teaching,
-        pika_teleop=pika_teleop,
+        pika_teleop=pika_teleop, converter=converter,
     )
 
     # 启动慢速归位 (按要求放在 Vive 连接之后): 上电后位姿未知, 慢速求稳;
@@ -1278,7 +1502,12 @@ def main():
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         if recorder.is_recording:
-            recorder.stop()
+            saved = recorder.stop()
+            if saved and converter is not None:
+                converter.enqueue(saved)
+        # 排空后台转换队列(把本次未转完的 episode 全部转完)后再释放硬件
+        if converter is not None:
+            converter.shutdown()
         vive_ctrl.shutdown()
         if pika_teleop is not None:
             pika_teleop.shutdown()
