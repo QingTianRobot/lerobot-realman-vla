@@ -14,6 +14,7 @@
 
 采集数据格式：HDF5
   - observations/qpos: (N, 7)   [6关节角 + 夹爪(归一化 0~1, 1=张开)]
+  - observations/ee_pose: (N, 6)  [末端笛卡尔位姿 x,y,z,rx,ry,rz (米/弧度), 机械臂直接读取非解算]
   - observations/images/camera_global: (N, H, W, 3)
   - observations/images/camera_left: (N, H, W, 3)
   - action: (N, 7)              [下一帧的 qpos]
@@ -445,6 +446,7 @@ class DataRecorder:
 
     数据格式:
       observations/qpos:             (N, 7) float32  [6关节角 + 夹爪位置]
+      observations/ee_pose:          (N, 6) float32  [末端笛卡尔位姿 x,y,z,rx,ry,rz (米/弧度), 机械臂直接返回, 非解算]
       observations/images/camera_global:  (N, H, W, 3) uint8
       observations/images/camera_left: (N, H, W, 3) uint8
       action:                        (N, 7) float32  [下一帧的qpos，即行为克隆标签]
@@ -460,14 +462,16 @@ class DataRecorder:
         self.is_recording = False
         self.filename = None
         self.target_fps = target_fps
-        self.data_buffer = {'qpos': [], 'images_top': [], 'images_wrist': [], 'timestamps': []}
+        self.data_buffer = {'qpos': [], 'ee_pose': [], 'images_top': [],
+                            'images_wrist': [], 'timestamps': []}
 
     def start(self, filename):
         if self.is_recording:
             return
         self.filename = filename
         self.is_recording = True
-        self.data_buffer = {'qpos': [], 'images_top': [], 'images_wrist': [], 'timestamps': []}
+        self.data_buffer = {'qpos': [], 'ee_pose': [], 'images_top': [],
+                            'images_wrist': [], 'timestamps': []}
         self.record_start_time = time.time()
         self.thread = threading.Thread(target=self._record_loop, daemon=True)
         self.thread.start()
@@ -498,6 +502,10 @@ class DataRecorder:
                     code, state = self.arm.rm_get_current_arm_state()
 
                 joint_angles = state['joint'] if code == 0 else [0] * 6
+                # 末端位姿与关节角来自同一次 rm_get_current_arm_state() 调用:
+                # state['pose'] = [x,y,z,rx,ry,rz] (米/弧度), 机械臂控制器直接返回, 非正/逆解算。
+                # 读失败时用 6 个 0 兜底, 与 qpos 保持帧数对齐。
+                ee_pose = [float(x) for x in state['pose'][:6]] if code == 0 else [0.0] * 6
                 # 夹爪走独立串口，后台轮询线程已缓存反馈，无需 arm_lock
                 gripper_val = self.gripper.get_position_normalized()
 
@@ -505,6 +513,7 @@ class DataRecorder:
                 img_wrist = self.cam_wrist.get_frame()
 
                 self.data_buffer['qpos'].append(joint_angles + [gripper_val])
+                self.data_buffer['ee_pose'].append(ee_pose)
                 self.data_buffer['images_top'].append(img_top)
                 self.data_buffer['images_wrist'].append(img_wrist)
                 self.data_buffer['timestamps'].append(timestamp)
@@ -531,6 +540,7 @@ class DataRecorder:
                 f.attrs['sim'] = False
                 f.attrs['fps'] = self.target_fps
                 f.create_dataset('observations/qpos', data=np.array(qpos))
+                f.create_dataset('observations/ee_pose', data=np.array(self.data_buffer['ee_pose']))
                 f.create_dataset('action', data=np.array(actions))
                 f.create_dataset('timestamps', data=np.array(timestamps))
                 f.create_dataset('observations/images/camera_global',
@@ -663,13 +673,35 @@ class CollectorController:
             for i in range(countdown, 0, -1):
                 print(f"    {i}...", flush=True)
                 time.sleep(1.0)
+        # 非阻塞下发: 只在发送指令的瞬间持锁, 随即释放, 让录制线程能在归位过程中持续
+        # 采到机械臂真实轨迹。切勿用 block=1 —— 它会全程持锁数秒, 饿死录制线程,
+        # 导致这段归位运动一帧都没录进 episode (表现为"复位数据被跳过")。
         with self.arm_lock:
-            ret = self.arm.rm_movej_p(self.robot_init_pose, int(speed), 0, 0, int(block))
+            ret = self.arm.rm_movej_p(self.robot_init_pose, int(speed), 0, 0, 0)
         if ret != 0:
             print(f"[!] {label}失败: rm_movej_p ret={ret} (位姿可能不可达, 检查 ROBOT_INIT 标定)")
             return False
+        if block:
+            self._wait_until_arrived(label)
         print(f"[✓] {label}完成 (v={speed}%)")
         return True
+
+    def _wait_until_arrived(self, label, timeout=60.0, poll=0.05):
+        """轮询等待机械臂到达 ROBOT_INIT (配合非阻塞 movej_p 使用)。
+
+        每次只短暂持锁读一次位姿、随即释放并 sleep, 空档让录制线程采到归位轨迹;
+        到位(位置<ARM_HOME_POS_TOL 且姿态<ARM_HOME_ORI_TOL)即返回。超时仅告警不阻塞。
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            cur = self._read_arm_pose()
+            if cur is not None:
+                dp, dang = _pose_deviation(cur, self.robot_init_pose)
+                if dp < ARM_HOME_POS_TOL and dang < ARM_HOME_ORI_TOL:
+                    return True
+            time.sleep(poll)
+        print(f"[!] {label}等待到位超时 ({timeout:.0f}s): 机械臂可能未使能/被限位/急停, 或 ret=0 却没动")
+        return False
 
     # ---------- 动作 (每个 action_<name> 对应按键表里的一个动作) ----------
     def action_calibrate_vive(self, **_):
