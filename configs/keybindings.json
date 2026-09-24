@@ -10,6 +10,7 @@
     {"key": "1", "action": "gripper_pct", "args": {"pct": 1},  "label": "夹爪 1%"},
     {"key": "2", "action": "gripper_pct", "args": {"pct": 50},  "label": "夹爪 50%"},
     {"key": "3", "action": "gripper_pct", "args": {"pct": 100}, "label": "夹爪 100%"},
+    {"key": "p", "action": "toggle_gripper_source", "label": "夹爪控制源 Pika主手/键盘 切换(互斥)"},
     {"key": "q", "action": "quit",           "label": "退出"}
   ]
 }

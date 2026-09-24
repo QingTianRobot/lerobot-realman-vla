@@ -55,6 +55,11 @@ GRIPPER_SLAVE_ID = 2          # 知行夹爪 Modbus 从站地址
 GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准
 
+# Pika Sense 主手夹爪 (可选第二套夹爪控制源, 与键盘互斥; 需 --pika-gripper 启用)
+PIKA_GRIPPER_PORT = "/dev/tty_pika_left"   # 见 /etc/udev/rules.d/98-usb-serial.rules 的 PIKA_LEFT
+PIKA_TELEOP_HZ = 30          # 主手→从手映射下发频率(Hz); 从手 move_normalized 异步覆盖式下发, 总线按其 poll_hz 消费
+PIKA_TELEOP_DEADBAND = 0.02  # 归一化死区: 变化<此值不重复下发, 减少知行 RTU 总线写入
+
 # 机械臂初始位姿（Vive遥操作零点对应的机械臂笛卡尔位姿）
 # 含义: 按 v 校准零点后, tracker 在零点时机械臂应处的位姿; 按 w 启用后机械臂以此为基础跟随。
 # 标定: 手动把机械臂移到一个安全顺手的起始位, 读它的笛卡尔位姿填进来。
@@ -560,6 +565,61 @@ class ViveController:
             self.vive = None
 
 
+# ============ Pika 主手夹爪遥操模块 ============
+class PikaGripperTeleop:
+    """Pika Sense 主手夹爪 → 机械臂从手夹爪 的遥操线程 (与键盘夹爪控制互斥)。
+
+    只接管夹爪, 不碰机械臂位姿, 无需 arm_lock。仅当【被选为当前控制源(enabled)】
+    且【机械臂遥操已开启(teleop_gate 为真)】时, 才按 hz 读主手归一化行程写到从手夹爪
+    (move_normalized 异步覆盖式下发, 由知行总线线程按 poll_hz 消费); 变化小于 deadband
+    不重复下发, 减少 RTU 总线写入。即: 按 w 开启遥操→夹爪跟随主手, 暂停遥操→夹爪停写。
+
+    teleop_gate: 无参可调用返回 bool, 判断机械臂遥操是否开启; None 表示不门控(如示教模式)。
+    """
+
+    def __init__(self, master, gripper, hz=PIKA_TELEOP_HZ, deadband=PIKA_TELEOP_DEADBAND,
+                 teleop_gate=None):
+        self.master = master
+        self.gripper = gripper
+        self.hz = max(1.0, float(hz))
+        self.deadband = max(0.0, float(deadband))
+        self.teleop_gate = teleop_gate
+        self.enabled = False       # 仅在被设为当前夹爪控制源时写从手
+        self.running = True
+        self._last_v = None
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        interval = 1.0 / self.hz
+        last_err = None
+        while self.running:
+            time.sleep(interval)
+            # 双重门控: 被选为控制源 且 (无门控 或 机械臂遥操已开启) 才写从手
+            gate_open = self.teleop_gate is None or bool(self.teleop_gate())
+            if not self.enabled or not gate_open:
+                self._last_v = None   # 未接管/遥操暂停期间清缓存, 重新生效时立即下发一次对齐主手
+                continue
+            try:
+                v = self.master.get_normalized()
+                if v is None:
+                    continue
+                if self._last_v is not None and abs(v - self._last_v) < self.deadband:
+                    continue
+                self.gripper.move_normalized(v)
+                self._last_v = v
+            except Exception as e:  # noqa: BLE001 - 遥操线程不能因单次异常中断
+                if str(e) != last_err:
+                    print(f"[!] Pika 夹爪遥操异常: {e}")
+                    last_err = str(e)
+
+    def shutdown(self):
+        self.running = False
+        self.enabled = False
+        if getattr(self, "thread", None) is not None:
+            self.thread.join(timeout=1.0)
+
+
 # ============ 数据录制模块 ============
 class DataRecorder:
     """以固定频率录制机械臂状态、相机图像到 HDF5
@@ -688,6 +748,7 @@ FALLBACK_BINDINGS = [
     {"key": "c", "action": "gripper_close",  "label": "夹爪闭合"},
     {"key": "1", "action": "gripper_pct", "args": {"pct": 30}, "label": "夹爪 30%"},
     {"key": "2", "action": "gripper_pct", "args": {"pct": 60}, "label": "夹爪 60%"},
+    {"key": "p", "action": "toggle_gripper_source", "label": "夹爪控制源 Pika主手/键盘 切换(互斥)"},
     {"key": "q", "action": "quit",           "label": "退出"},
 ]
 
@@ -747,7 +808,7 @@ class CollectorController:
     _ACTION_PREFIX = "action_"
 
     def __init__(self, arm, arm_lock, gripper, vive_ctrl, recorder,
-                 save_dir, task_name, teaching=False):
+                 save_dir, task_name, teaching=False, pika_teleop=None):
         self.arm = arm
         self.arm_lock = arm_lock
         self.gripper = gripper
@@ -756,6 +817,15 @@ class CollectorController:
         self.save_dir = save_dir
         self.task_name = task_name
         self.teaching = teaching
+        # Pika 主手夹爪遥操线程 (未启用时为 None)
+        self.pika_teleop = pika_teleop
+        # 夹爪控制源: pika | keyboard, 二者互斥, 由 toggle_gripper_source 切换。
+        # 有 Pika 主手时默认优先用它(第一选择); 夹爪仅在机械臂遥操开启后跟随。
+        if pika_teleop is not None:
+            self.gripper_source = "pika"
+            pika_teleop.enabled = True
+        else:
+            self.gripper_source = "keyboard"
         self.quit_requested = False
         self.saved_count = 0
         # ROBOT_INIT 合成 6 维笛卡尔位姿 [x,y,z, rx,ry,rz] (米/弧度), 供 movej_p 使用
@@ -878,18 +948,50 @@ class CollectorController:
         self.move_to_init(ARM_HOME_SPEED_NORMAL, block=1, countdown=0, label="复位")
         self.print_status()
 
+    def _gripper_keyboard_blocked(self):
+        """当前为 Pika 主手控制时, 键盘夹爪键被拦截(互斥), 返回 True 表示已拦下。"""
+        if self.gripper_source == "pika":
+            print("[i] 当前为 Pika 主手控制夹爪, 键盘夹爪键已禁用 (按切换键回到键盘)")
+            return True
+        return False
+
     def action_gripper_open(self, **_):
+        if self._gripper_keyboard_blocked():
+            return
         self.gripper.open()
         print("夹爪: 张开")
 
     def action_gripper_close(self, **_):
+        if self._gripper_keyboard_blocked():
+            return
         self.gripper.close()
         print("夹爪: 闭合")
 
     def action_gripper_pct(self, pct=100, **_):
+        if self._gripper_keyboard_blocked():
+            return
         pct = max(0, min(100, int(pct)))
         self.gripper.move_pct(pct)
         print(f"夹爪: {pct}%")
+
+    def action_toggle_gripper_source(self, **_):
+        """切换夹爪控制源: Pika 主手 <-> 键盘 (互斥; 默认 Pika 主手)。
+
+        切到 Pika: 仅当机械臂遥操已开启(w)时从手才跟随主手当前开合
+        (主手在最大张开则从手张开到底, 属预期); 切到键盘: Pika 线程停写, 键盘 o/c/1/2/3 恢复。
+        """
+        if self.pika_teleop is None:
+            print("[i] 本次未启用 Pika 夹爪 (--no-pika-gripper 或连接失败), 仍用键盘控制")
+            return
+        if self.gripper_source == "keyboard":
+            self.gripper_source = "pika"
+            self.pika_teleop.enabled = True
+            print("[i] 夹爪控制源 → Pika 主手 (键盘夹爪键暂停; 需按 w 开启遥操后从手才跟随主手)")
+        else:
+            self.gripper_source = "keyboard"
+            self.pika_teleop.enabled = False
+            print("[i] 夹爪控制源 → 键盘 (Pika 主手暂停)")
+        self.print_status()
 
     def action_quit(self, **_):
         self.quit_requested = True
@@ -915,6 +1017,7 @@ class CollectorController:
             "recording": bool(self.recorder.is_recording),
             "saved": int(self.saved_count),
             "gripper": round(float(self.gripper.get_position_normalized()), 3),
+            "gripper_source": self.gripper_source,
             "quit": bool(self.quit_requested),
         }
 
@@ -922,8 +1025,9 @@ class CollectorController:
         s = self.snapshot()
         teleop = "启用" if s["teleop"] else "暂停"
         rec = "录制中" if s["recording"] else "空闲"
+        src = "Pika主手" if s["gripper_source"] == "pika" else "键盘"
         print(f"[状态] 遥控:{teleop} | {rec} | 已存 {s['saved']} 条 | "
-              f"夹爪 {int(s['gripper'] * 100)}%")
+              f"夹爪 {int(s['gripper'] * 100)}% (控制源:{src})")
 
 
 # ============ 主程序 ============
@@ -935,6 +1039,12 @@ def main():
     parser.add_argument('--cam-wrist', type=str, default=DEFAULT_CAM_WRIST_SERIAL, help='腕部相机(Orbbec 305)序列号，留空取第一个设备')
     parser.add_argument('--gripper-port', type=str, default=GRIPPER_PORT, help='知行夹爪串口')
     parser.add_argument('--gripper-slave-id', type=int, default=GRIPPER_SLAVE_ID, help='知行夹爪 Modbus 从站地址')
+    parser.add_argument('--pika-gripper', action=argparse.BooleanOptionalAction, default=True,
+                        help='启用 Pika Sense 主手夹爪作为首选夹爪控制源(与键盘互斥, 按 p 切换); 默认开, --no-pika-gripper 关')
+    parser.add_argument('--pika-port', type=str, default=PIKA_GRIPPER_PORT,
+                        help='Pika Sense 串口(默认 %(default)s)')
+    parser.add_argument('--pika-hz', type=float, default=PIKA_TELEOP_HZ,
+                        help='Pika 主手→从手映射下发频率(Hz), 默认 %(default)s')
     parser.add_argument('--save-dir', type=str, default='data/raw_hdf5', help='数据保存目录')
     parser.add_argument('--task-name', type=str, default='task_pick_cube', help='任务名称')
     parser.add_argument('--fps', type=int, default=30, help='采集帧率')
@@ -1017,10 +1127,34 @@ def main():
     # 初始化录制器
     recorder = DataRecorder(arm, arm_lock, gripper, cam_top, cam_wrist, args.fps)
 
+    # 可选: Pika Sense 主手夹爪 (首选夹爪控制源, 与键盘互斥; 默认开启)
+    # 惰性导入: 仅在启用时才引入 vendor/pika_sdk, 未 clone submodule 也不影响常规采集。
+    pika_master = None
+    pika_teleop = None
+    if args.pika_gripper:
+        from pika_gripper import PikaGripperMaster
+        pika_master = PikaGripperMaster(port=args.pika_port)
+        if pika_master.connect():
+            print(f"Pika 主手夹爪: OK ({args.pika_port}) "
+                  f"行程 {pika_master.min_mm:.0f}~{pika_master.max_mm:.0f}mm")
+            # 遥操门控: Vive 模式下仅当机械臂遥操已开启(w)时夹爪才跟随主手;
+            # 示教模式无遥操概念, 不门控(gate=None), 夹爪随控制源生效。
+            teleop_gate = None if args.teaching else (lambda: vive_ctrl.control_enabled)
+            pika_teleop = PikaGripperTeleop(pika_master, gripper, hz=args.pika_hz,
+                                            teleop_gate=teleop_gate)
+            if args.teaching:
+                print("[i] 夹爪控制源默认 Pika 主手 (示教模式无遥操门控; 按 p 切到键盘)")
+            else:
+                print("[i] 夹爪控制源默认 Pika 主手; 按 w 开启遥操后夹爪才跟随主手 (按 p 切到键盘)")
+        else:
+            print(f"[!] Pika 主手夹爪连接失败 ({args.pika_port}), 本次仅用键盘控制")
+            pika_master = None
+
     # 动作层: terminal 与(后续)web 前端共用同一套命名动作
     controller = CollectorController(
         arm, arm_lock, gripper, vive_ctrl, recorder,
         save_dir=args.save_dir, task_name=args.task_name, teaching=args.teaching,
+        pika_teleop=pika_teleop,
     )
 
     # 启动慢速归位 (按要求放在 Vive 连接之后): 上电后位姿未知, 慢速求稳;
@@ -1059,6 +1193,10 @@ def main():
         if recorder.is_recording:
             recorder.stop()
         vive_ctrl.shutdown()
+        if pika_teleop is not None:
+            pika_teleop.shutdown()
+        if pika_master is not None:
+            pika_master.disconnect()
         cam_top.close()
         cam_wrist.close()
         gripper.disable()
