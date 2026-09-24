@@ -147,7 +147,7 @@ lerobot-realman-vla/
 本项目用 [uv](https://docs.astral.sh/uv/) 管理环境（Python 3.10，仓库内 `.venv`），镜像走阿里云（见 `uv.toml`）。
 
 ```bash
-# 克隆本项目（--recursive 拉取知行夹爪 SDK 子模块 vendor/changingtek_rtu_sdk）
+# 克隆本项目（--recursive 拉取子模块：知行夹爪 SDK vendor/changingtek_rtu_sdk、vendor/pika_sdk）
 git clone --recursive https://github.com/Humble2Full/lerobot-realman-vla.git
 cd lerobot-realman-vla
 # 若已普通 clone（子模块目录为空），补拉：git submodule update --init --recursive
