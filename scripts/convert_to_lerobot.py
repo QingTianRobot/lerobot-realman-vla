@@ -44,6 +44,10 @@ def convert_hdf5_episode(hdf5_path: Path):
             'camera_global': np.array(f['observations/images/camera_global']),    # (N, H, W, 3)
             'camera_left': np.array(f['observations/images/camera_left']),  # (N, H, W, 3)
         }
+        # 末端位姿为可选字段: 旧 HDF5 没有则跳过, 保持向后兼容。
+        # 直接从机械臂读取的 [x,y,z,rx,ry,rz] (米/弧度), 非解算。
+        if 'observations/ee_pose' in f:
+            data['ee_pose'] = np.array(f['observations/ee_pose'])   # (N, 6)
     return data
 
 
@@ -84,6 +88,8 @@ def main():
     state_dim = sample_data['qpos'].shape[1]    # 7
     action_dim = sample_data['action'].shape[1]  # 7
     img_h, img_w = sample_data['camera_global'].shape[1:3]
+    # 末端位姿可选: 仅当首帧 HDF5 含 ee_pose 时才声明并写入该 feature
+    has_ee_pose = 'ee_pose' in sample_data
 
     print(f"状态维度: {state_dim}, 动作维度: {action_dim}")
     print(f"图像尺寸: {img_h}x{img_w}")
@@ -115,6 +121,17 @@ def main():
                        "joint_5", "joint_6", "gripper"],
         },
     }
+
+    # 末端位姿作为独立观测字段写入。
+    # 注: 必须是独立键 observation.ee_pose, 切勿拼进 observation.state (会改 state 维度、破坏现有训练)。
+    # ACT/SmolVLA/Pi0 均只读 observation.state, 此字段作为 STATE 类型存在但不被模型消费,
+    # 因此加入后不影响当前训练; 待后续需要时再改 modeling 才能真正喂给模型。
+    if has_ee_pose:
+        features["observation.ee_pose"] = {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": ["x", "y", "z", "rx", "ry", "rz"],
+        }
 
     # 创建 LeRobot 数据集
     print(f"\n创建数据集: {args.output_dir}")
@@ -151,6 +168,9 @@ def main():
                     data['action'][frame_idx].astype(np.float32)),
                 "task": args.task,
             }
+            if has_ee_pose:
+                frame_data["observation.ee_pose"] = torch.from_numpy(
+                    data['ee_pose'][frame_idx].astype(np.float32))
             dataset.add_frame(frame_data)
 
         dataset.save_episode()
