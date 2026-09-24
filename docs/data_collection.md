@@ -161,7 +161,7 @@ python scripts/collect_data.py \
     --save-dir data/raw_hdf5 --task-name pick_cube --fps 30
 ```
 
-启动后逐项确认状态行；Vive 就绪后会**自动慢速归位到 `ROBOT_INIT`**（3 秒倒计时，请清空机械臂周围），随后打印单键命令表（无需回车）：
+启动后逐项确认状态行；Vive 就绪后会**自动慢速归位到 `ROBOT_INIT`**（3 秒倒计时，请清空机械臂周围；**若机械臂本就在 `ROBOT_INIT` 附近——位置<2cm 且姿态<5°——则自动跳过、不做无谓的慢速运动**），随后打印单键命令表（无需回车）：
 
 ```
 相机: top=OK, wrist=OK
@@ -172,7 +172,7 @@ Vive: OK
     3...
     2...
     1...
-[✓] 慢速归位完成 (v=10%)
+[✓] 慢速归位完成 (v=5%)
 --------------------------------------------------
 单键即触发 (无需回车):
   [w] 遥控 开/关(自动取当前Tracker为零点)
@@ -189,7 +189,7 @@ Vive: OK
 [状态] 遥控:暂停 | 空闲 | 已存 0 条 | 夹爪 0%
 ```
 
-> 命令表由 [`configs/keybindings.json`](../configs/keybindings.json) 自动生成，改该文件即可自定义按键（terminal 与后续 web 前端共用）。不想启动即归位加 `--no-home`；归位速度/倒计时见 `collect_data.py` 顶部 `ARM_HOME_*` 常量。
+> 命令表由 [`configs/keybindings.json`](../configs/keybindings.json) 自动生成，改该文件即可自定义按键（terminal 与后续 web 前端共用）。不想启动即归位加 `--no-home`；启动慢速归位在机械臂已处于 `ROBOT_INIT` 附近（位置<`ARM_HOME_POS_TOL`=2cm 且姿态<`ARM_HOME_ORI_TOL`=5°）时自动跳过，打印 `[i] 已在起始位附近 … 跳过慢速归位`；归位速度/倒计时/容差见 `collect_data.py` 顶部 `ARM_HOME_*` 常量。
 
 ---
 

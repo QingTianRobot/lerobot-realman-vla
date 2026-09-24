@@ -71,9 +71,11 @@ ROBOT_INIT_ORI = np.array([-3.102, 0.065, 1.609])
 VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw(Z)] 单位度
 
 # 机械臂归位 (rm_movej_p: 关节空间规划到 ROBOT_INIT 笛卡尔位姿, 大位移最稳、不撞奇异点)
-ARM_HOME_SPEED_SLOW = 10     # 启动慢速归位速度百分比 v(1~100): 上电位姿未知, 求稳
+ARM_HOME_SPEED_SLOW = 5      # 启动慢速归位速度百分比 v(1~100): 上电位姿未知, 求稳(用户指定 5%)
 ARM_HOME_SPEED_NORMAL = 45   # 复位键常速归位速度百分比
 ARM_HOME_COUNTDOWN = 3       # 启动归位前倒计时秒数, 留时间清空机械臂周围
+ARM_HOME_POS_TOL = 0.02      # 慢速归位"已在起始位附近"的位置容差(米): 与 ROBOT_INIT 偏差<2cm
+ARM_HOME_ORI_TOL = float(np.radians(5.0))   # 同上姿态容差(弧度): 偏差<5° 则跳过慢速归位
 # ⚠️ rm_set_arm_run_mode 是"仿真(0)/真实(1)"开关, 不是运动模式! 全程保持真实(1):
 #    规划运动(rm_movej_p)与 CANFD 透传(rm_movep_canfd)都在真实模式下执行, 归位无需切模式
 #    (切到 0=仿真会让指令只在仿真里跑、真实机械臂不动 —— 这正是"归位没反应"的坑)。
@@ -181,6 +183,18 @@ def _scale_rotation(R, s):
     axis = np.array([q[1], q[2], q[3]]) / vnorm
     q2 = np.concatenate(([math.cos(half)], axis * math.sin(half)))
     return _quat_to_matrix(q2)
+
+
+def _pose_deviation(cur_pose, target_pose):
+    """两个 6D 位姿 [x,y,z,rx,ry,rz](米/弧度) 的偏差 → (位置偏差 米, 姿态偏差 弧度)。
+
+    姿态用旋转矩阵测地角 arccos((tr(R_curᵀ·R_tgt)-1)/2), 避免欧拉角 wrap / ±π 歧义
+    (直接比 rx/ry/rz 会把 -3.1 与 +3.1 当成差 6.2, 实则同一朝向)。
+    """
+    dp = float(np.linalg.norm(np.asarray(cur_pose[:3]) - np.asarray(target_pose[:3])))
+    R_rel = _euler_xyz_to_matrix(np.asarray(cur_pose[3:6])).T @ _euler_xyz_to_matrix(np.asarray(target_pose[3:6]))
+    cos_t = float(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0))
+    return dp, float(np.arccos(cos_t))
 
 
 # ============ Vive 遥控模块 ============
@@ -617,13 +631,33 @@ class CollectorController:
                                 (list(ROBOT_INIT_POS) + list(ROBOT_INIT_ORI))]
 
     # ---------- 机械臂归位 ----------
-    def move_to_init(self, speed, block=1, countdown=0, label="归位"):
+    def _read_arm_pose(self):
+        """读机械臂当前笛卡尔位姿 [x,y,z,rx,ry,rz] (米/弧度); 失败返回 None。"""
+        try:
+            with self.arm_lock:
+                code, state = self.arm.rm_get_current_arm_state()
+            if code == 0 and state and state.get("pose"):
+                return [float(x) for x in state["pose"][:6]]
+        except Exception:
+            pass
+        return None
+
+    def move_to_init(self, speed, block=1, countdown=0, label="归位", skip_if_near=False):
         """rm_movej_p 关节空间规划到 ROBOT_INIT (大位移最稳、不撞奇异点)。
 
         机械臂全程处于真实模式(run_mode=1), 规划运动直接执行即可 —— 切勿切到
         run_mode=0(那是"仿真"模式, 指令只在仿真里跑、真实机械臂不动)。
         失败仅打印告警、不下发危险运动; ret!=0 多为位姿不可达, 见 ROBOT_INIT 标定。
+        skip_if_near=True: 若已在 ROBOT_INIT 附近(位置<ARM_HOME_POS_TOL 且姿态<ARM_HOME_ORI_TOL),
+        直接跳过、不下发运动 —— 供启动慢速归位用, 免得每次重启都无谓地慢速跑一遍。
         """
+        if skip_if_near:
+            cur = self._read_arm_pose()
+            if cur is not None:
+                dp, dang = _pose_deviation(cur, self.robot_init_pose)
+                if dp < ARM_HOME_POS_TOL and dang < ARM_HOME_ORI_TOL:
+                    print(f"[i] 已在起始位附近 (位置 {dp * 100:.1f}cm / 姿态 {np.degrees(dang):.1f}°), 跳过{label}")
+                    return True
         if countdown > 0:
             print(f"[!] 机械臂即将{label}到起始位, 请清空周围! {countdown} 秒后开始...")
             for i in range(countdown, 0, -1):
@@ -802,10 +836,12 @@ def main():
         save_dir=args.save_dir, task_name=args.task_name, teaching=args.teaching,
     )
 
-    # 启动慢速归位 (按要求放在 Vive 连接之后): 上电后位姿未知, 慢速求稳
+    # 启动慢速归位 (按要求放在 Vive 连接之后): 上电后位姿未知, 慢速求稳;
+    # skip_if_near=True: 已在 ROBOT_INIT 附近就跳过, 不做无谓的慢速运动
     if not args.no_home:
         controller.move_to_init(ARM_HOME_SPEED_SLOW, block=1,
-                                countdown=max(0, args.home_countdown), label="慢速归位")
+                                countdown=max(0, args.home_countdown), label="慢速归位",
+                                skip_if_near=True)
 
     # 加载按键表 (terminal/web 共用 JSON), 据此生成命令提示与单键映射
     bindings = load_keybindings(args.keybindings)
