@@ -63,6 +63,13 @@ def main():
                         help="帧率，应与采集时一致（默认30）")
     parser.add_argument("--task", type=str, default="pick up the cube and place it in the basket",
                         help="任务描述（VLA策略需要，必须与推理时完全一致）")
+    parser.add_argument("--vcodec", type=str, default="h264",
+                        choices=["h264", "hevc", "libsvtav1"],
+                        help="视频编码器（默认 h264；LeRobot 默认的 libsvtav1/AV1 编码极慢，h264 快数倍）")
+    parser.add_argument("--image-writer-processes", type=int, default=4,
+                        help="并行写 PNG 帧的进程数（0=串行）")
+    parser.add_argument("--image-writer-threads", type=int, default=4,
+                        help="并行写 PNG 帧的线程数（0=串行）")
     args = parser.parse_args()
 
     # 检查输出目录
@@ -142,6 +149,11 @@ def main():
         root=args.output_dir,
         robot_type="realman",
         use_videos=True,
+        # AV1(libsvtav1) 编码 CPU 密集、比 h264 慢数倍; 训练用 h264 足够且不影响格式合法性
+        vcodec=args.vcodec,
+        # add_frame 默认串行写 PNG 到磁盘, 开多进程/线程并行缓解 I/O 阻塞
+        image_writer_processes=args.image_writer_processes,
+        image_writer_threads=args.image_writer_threads,
     )
 
     total_frames = 0

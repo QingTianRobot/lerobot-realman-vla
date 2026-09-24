@@ -81,6 +81,28 @@ ARM_HOME_ORI_TOL = float(np.radians(5.0))   # 同上姿态容差(弧度): 偏差
 #    规划运动(rm_movej_p)与 CANFD 透传(rm_movep_canfd)都在真实模式下执行, 归位无需切模式
 #    (切到 0=仿真会让指令只在仿真里跑、真实机械臂不动 —— 这正是"归位没反应"的坑)。
 VIVE_CALIB_FRAMES = 5        # 启用遥操时自动校准零点的平均帧数 (原 30 帧太长, 现取当前手持位)
+# 遥操透传频率(Hz): rm_movep_canfd 是透传指令, 为高频稳定流设计。频率越高跟随越紧、延迟越低。
+# 睿尔曼官方低跟随示例 RMDemo_MovejCANFD 用 100Hz; 原实现写死 20Hz(interval=0.05)是遥操延迟主因。
+# 50~100 之间按机器负载调; 若配合录制抢锁明显, 可先取 50。
+VIVE_CONTROL_HZ = 100        # 默认配合高跟随(需≥100Hz); 用 --no-high-follow 低跟随且嫌抢锁时可显式 --control-hz 50
+# 高跟随模式(follow=True): 滞后最小, 但透传周期要求 ≤10ms(即 ≥100Hz)。开启后若 control_hz<100 会自动抬到 100。
+#   默认开(本项目实机调定); --no-high-follow 可关(改回低跟随, 控制器自规划更软、无 ≤10ms 约束)。
+VIVE_FOLLOW_HIGH = True
+# SDK 控制器侧轨迹平滑(仅高跟随生效): 治理"伺服刚性嗡颤"——完全透传下伺服刚性追每个设定点激起的机械高频振,
+# 发生在我们指令的下游, 软件滤波(One Euro)够不着, 只能靠控制器在伺服前重新拟合/滤波轨迹来抑制。
+#   trajectory_mode: 0=完全透传(无 SDK 平滑), 1=曲线拟合, 2=滤波(默认)。
+#   radio: 拟合(0~100)/滤波(0~1000)平滑系数, 越大越平滑、滞后越明显; mode=0 时无效。
+# 与手抖分工: 手部生理抖/tracker 噪声(输入端)→ 下面 One Euro; 伺服嗡颤(控制器端)→ 本项。
+VIVE_TRAJ_MODE = 2           # 默认滤波模式(实机调定: 高跟随下压伺服嗡颤)
+VIVE_TRAJ_RADIO = 600        # 默认滤波系数(越大越平滑、滞后越大; 实机 600 手感可接受)
+# One Euro 自适应滤波 (替代固定截止低通): 慢速/静止时用低截止→强平滑压手抖, 快速运动时自动升截止→几乎无滞后。
+# 化解"平滑 vs 延迟"两难: 可保留高跟随@100Hz 的跟手, 同时压掉高频细碎颤 (固定低通做不到)。
+#   MINCUTOFF(Hz): 零速截止频率。越低越压静止手抖(慢速运动滞后略增); 静止仍颤→降到 0.5/0.1。
+#   BETA: 速度系数(截止随速度上升的斜率)。经验 10~30 越跟手; 默认取 1.0(刻意压快速段跟随、增阻尼防"太快"), 嫌拖可调大。
+#   DCUTOFF(Hz): 对"速度"再做低通的截止, 一般 1.0 即可。
+VIVE_OE_MINCUTOFF = 0.1      # 默认强平滑压静止手抖(实机调定)
+VIVE_OE_BETA = 1.0           # 默认低速度系数: 快速段也重平滑, 抑制"跟随太快"(代价: 滞后略增)
+VIVE_OE_DCUTOFF = 1.0
 # ============ 配置区域结束 ============
 
 
@@ -198,6 +220,60 @@ def _pose_deviation(cur_pose, target_pose):
     return dp, float(np.arccos(cos_t))
 
 
+class OneEuroFilter:
+    """One Euro 自适应低通滤波器 (Casiez et al. 2012), 支持多维 numpy 向量。
+
+    固定截止的低通在"平滑"与"延迟"之间此消彼长; One Euro 用"信号速度"自适应调截止:
+    慢速(手抖主导)→低截止→强平滑; 快速(有意运动)→高截止→几乎无滞后。适合遥操/VR 手部去噪。
+
+    参数:
+      freq      采样频率(Hz), 取控制循环频率。
+      mincutoff 零速截止频率(Hz): 越低越压静止手抖, 慢速运动滞后略增。
+      beta      速度系数: 截止随速度上升的斜率。越大快速越跟手, 但快速时可能漏过抖动。
+      dcutoff   对速度做低通的截止频率(Hz), 一般 1.0。
+    """
+
+    def __init__(self, freq, mincutoff=1.0, beta=0.0, dcutoff=1.0):
+        self.freq = max(1e-6, float(freq))
+        self.mincutoff = float(mincutoff)
+        self.beta = float(beta)
+        self.dcutoff = float(dcutoff)
+        self._x_prev = None
+        self._dx_prev = None
+
+    @property
+    def prev(self):
+        """上一次滤波输出 (供姿态四元数统一半球判断); 未初始化时为 None。"""
+        return self._x_prev
+
+    def _alpha(self, cutoff):
+        te = 1.0 / self.freq
+        tau = 1.0 / (2.0 * math.pi * max(1e-6, cutoff))
+        return 1.0 / (1.0 + tau / te)
+
+    def reset(self):
+        """清空历史; 重新 engage 时调用, 让滤波从新起点起步、不用旧值突跳。"""
+        self._x_prev = None
+        self._dx_prev = None
+
+    def __call__(self, x):
+        x = np.asarray(x, dtype=float)
+        if self._x_prev is None:
+            self._x_prev = x.copy()
+            self._dx_prev = np.zeros_like(x)
+            return x.copy()
+        dx = (x - self._x_prev) * self.freq            # 瞬时速度 (单位/秒)
+        ad = self._alpha(self.dcutoff)
+        dx_hat = ad * dx + (1.0 - ad) * self._dx_prev  # 低通后的速度估计
+        speed = float(np.linalg.norm(dx_hat))          # 多维共用一个标量速度
+        cutoff = self.mincutoff + self.beta * speed    # 速度越快截止越高
+        a = self._alpha(cutoff)
+        x_hat = a * x + (1.0 - a) * self._x_prev
+        self._x_prev = x_hat
+        self._dx_prev = dx_hat
+        return x_hat
+
+
 # ============ Vive 遥控模块 ============
 class ViveController:
     """Vive Tracker 遥操作控制器
@@ -211,11 +287,26 @@ class ViveController:
     避免欧拉角逐轴相减在大角度/万向锁处失效。
     """
 
-    def __init__(self, arm, arm_lock, tracker_serial=None, enable_vive=True):
+    def __init__(self, arm, arm_lock, tracker_serial=None, enable_vive=True,
+                 control_hz=VIVE_CONTROL_HZ, follow_high=VIVE_FOLLOW_HIGH,
+                 traj_mode=VIVE_TRAJ_MODE, traj_radio=VIVE_TRAJ_RADIO,
+                 oe_mincutoff=VIVE_OE_MINCUTOFF, oe_beta=VIVE_OE_BETA,
+                 oe_dcutoff=VIVE_OE_DCUTOFF):
         self.arm = arm
         self.arm_lock = arm_lock
         self.tracker_serial = tracker_serial or DEFAULT_TRACKER_SERIAL
         self.enable_vive = enable_vive
+        self.follow_high = bool(follow_high)
+        self.traj_mode = int(traj_mode)      # 控制器侧轨迹平滑(治伺服嗡颤), 仅高跟随生效
+        self.traj_radio = int(traj_radio)
+        # 高跟随要求透传周期 ≤10ms(≥100Hz); 频率不足则自动抬到 100, 否则控制器可能拒收/抖动
+        self.control_hz = max(1.0, float(control_hz))
+        if self.follow_high and self.control_hz < 100.0:
+            print(f"[i] 高跟随模式要求 ≥100Hz, control_hz 自动 {self.control_hz:.0f}→100")
+            self.control_hz = 100.0
+        # One Euro 自适应滤波: 位置/姿态各一个, 采样频率=控制频率。慢速去颤、快速跟手。
+        self._pos_filt = OneEuroFilter(self.control_hz, oe_mincutoff, oe_beta, oe_dcutoff)
+        self._quat_filt = OneEuroFilter(self.control_hz, oe_mincutoff, oe_beta, oe_dcutoff)
 
         # 遥操基点(位置/姿态): 初值用全局 ROBOT_INIT 兜底, 每次 enable() 会改绑到机械臂"当前"位姿
         self.robot_init_pos = ROBOT_INIT_POS.copy()
@@ -360,6 +451,8 @@ class ViveController:
         self.robot_init_pos = np.array(arm_pose[:3])
         self.robot_init_ori = np.array(arm_pose[3:6])
         self.robot_init_R = _euler_xyz_to_matrix(self.robot_init_ori)
+        self._pos_filt.reset()     # 重置滤波, 从本次 engage 位姿起步, 避免用旧滤波值突跳
+        self._quat_filt.reset()
         self.control_enabled = True
         print("遥控已启用 (Tracker 零点=当前手持位, 机械臂基点=当前位姿)")
 
@@ -368,13 +461,26 @@ class ViveController:
         print("遥控已暂停")
 
     def _control_loop(self):
-        """20Hz 遥控循环"""
-        interval = 0.05
+        """高频遥控循环 (deadline 节拍, 频率 self.control_hz, 默认 VIVE_CONTROL_HZ)。
+
+        用绝对 deadline 计时而非循环开头固定 sleep, 避免周期漂移累积成"阻塞感";
+        单步超时(读位姿/透传偶发变慢)则重置 deadline 丢弃积压, 防止随后指令突发。
+        """
+        interval = 1.0 / self.control_hz
         last_ret = 0      # 上一次 movep 返回码 (节流打印用)
         last_err = None   # 上一次异常信息 (节流打印用)
+        next_time = time.time()
 
         while self.running:
-            time.sleep(interval)
+            now = time.time()
+            if now < next_time:
+                time.sleep(min(0.002, next_time - now))
+                continue
+            # 落后超过一个周期: 重置节拍, 不补发积压指令 (避免机械臂追旧目标点抖动)
+            if now - next_time > interval:
+                next_time = now
+            next_time += interval
+
             if (not self.control_enabled or self.tracker is None
                     or self.vive_init_pos is None or self.vive_init_R is None):
                 continue
@@ -404,21 +510,35 @@ class ViveController:
                 R_delta = R_cur @ self.vive_init_R.T
                 R_delta = M @ R_delta @ M.T
                 R_delta = _scale_rotation(R_delta, scale_ori)   # 按 scale_ori 缩放转角
-                target_ori = _matrix_to_euler_xyz(R_delta @ self.robot_init_R)
+                R_target = R_delta @ self.robot_init_R
+                target_quat = _matrix_to_quat(R_target)          # [w,x,y,z]
+
+                # ---- One Euro 自适应滤波: 慢速去颤(强平滑)、快速跟手(几乎无滞后) ----
+                # 化解"平滑 vs 延迟"两难: 静止/慢速压掉高频细碎颤, 有意快速运动不加滞后。
+                # 姿态四元数滤波前先与上次输出统一半球, 避免符号翻转导致插值抵消。
+                q_prev = self._quat_filt.prev
+                if q_prev is not None and float(np.dot(q_prev, target_quat)) < 0:
+                    target_quat = -target_quat
+                filt_pos = self._pos_filt(target_pos)
+                filt_quat = self._quat_filt(target_quat)
+                filt_quat = filt_quat / np.linalg.norm(filt_quat)
 
                 # 安全限位（笛卡尔工作空间, 单位米）: 防止手滑把机械臂推出安全区。
                 # 换成你的实际可达范围; 若机械臂总在某方向到不了边界, 放宽对应上下限。
-                target_pos[0] = np.clip(target_pos[0], -0.5, 0.5)
-                target_pos[1] = np.clip(target_pos[1], -0.5, 0.5)
-                target_pos[2] = np.clip(target_pos[2], -0.15, 0.3)
+                filt_pos[0] = np.clip(filt_pos[0], -0.5, 0.5)
+                filt_pos[1] = np.clip(filt_pos[1], -0.5, 0.5)
+                filt_pos[2] = np.clip(filt_pos[2], -0.15, 0.3)
 
+                target_ori = _matrix_to_euler_xyz(_quat_to_matrix(filt_quat))
                 target_6d = [
-                    float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
+                    float(filt_pos[0]), float(filt_pos[1]), float(filt_pos[2]),
                     float(target_ori[0]), float(target_ori[1]), float(target_ori[2])
                 ]
 
                 with self.arm_lock:
-                    ret = self.arm.rm_movep_canfd(target_6d, False, 0, 60)
+                    # trajectory_mode/radio: 控制器侧轨迹平滑(治伺服刚性嗡颤); 手抖由 One Euro 处理
+                    ret = self.arm.rm_movep_canfd(target_6d, self.follow_high,
+                                                  self.traj_mode, self.traj_radio)
 
                 # 诊断: 返回码非 0 = 逆解失败/姿态不可达, 机械臂会停在上一位姿 (节流打印)
                 if ret != 0 and ret != last_ret:
@@ -543,12 +663,14 @@ class DataRecorder:
                 f.create_dataset('observations/ee_pose', data=np.array(self.data_buffer['ee_pose']))
                 f.create_dataset('action', data=np.array(actions))
                 f.create_dataset('timestamps', data=np.array(timestamps))
+                # gzip 对照片压缩率低且单线程极慢; lzf 快约 5~10x, 中间文件转完即删无需高压缩比
+                # (h5py 读取时透明解压, convert_to_lerobot.py 无需改动)
                 f.create_dataset('observations/images/camera_global',
                                  data=np.array(self.data_buffer['images_top']),
-                                 compression="gzip")
+                                 compression="lzf", chunks=True)
                 f.create_dataset('observations/images/camera_left',
                                  data=np.array(self.data_buffer['images_wrist']),
-                                 compression="gzip")
+                                 compression="lzf", chunks=True)
             print(f"保存: {os.path.basename(self.filename)} ({len(qpos)} frames)")
         except Exception as e:
             print(f"[!] 保存失败: {e}")
@@ -724,14 +846,18 @@ class CollectorController:
     def action_toggle_record(self, **_):
         """单键 toggle: 录制 开始<->停止并保存 (原 s/d 合并), 自动递增文件名。
 
-        停止(保存)后立即暂停遥操: 保存完机械臂不再跟随手, 便于复位/摆场景、也防误动;
+        停止时先暂停遥操再保存: 按 s 立即让机械臂停止跟随手(不必等落盘),
+        随后 _save() 阻塞期间机械臂已静止, 便于复位/摆场景、也防误动;
         下一条 episode 需重新按 w 启用(会以机械臂当前位姿重新取零点)。
         """
         if self.recorder.is_recording:
+            # 先暂停遥操: 避免随后的阻塞式 _save() 期间机械臂仍跟随手(lzf 后保存变快, 这段延迟更明显)
+            teleop_was_on = not self.teaching and self.vive.control_enabled
+            if teleop_was_on:
+                self.vive.disable()
             self.recorder.stop()
             self.saved_count += 1
-            if not self.teaching and self.vive.control_enabled:
-                self.vive.disable()
+            if teleop_was_on:
                 print("[i] 录制结束已保存, 遥操已自动暂停 (下条按 w 重新启用)")
         else:
             filename = get_next_filename(self.save_dir, self.task_name)
@@ -821,6 +947,19 @@ def main():
                         help='启动时不自动慢速归位到 ROBOT_INIT')
     parser.add_argument('--home-countdown', type=int, default=ARM_HOME_COUNTDOWN,
                         help='启动归位前倒计时秒数（0=不倒计时）')
+    parser.add_argument('--control-hz', type=float, default=VIVE_CONTROL_HZ,
+                        help='Vive 遥操透传频率(Hz)，越高跟随越紧延迟越低，默认 %(default)s')
+    parser.add_argument('--high-follow', action=argparse.BooleanOptionalAction, default=VIVE_FOLLOW_HIGH,
+                        help='高跟随模式(follow=True)：滞后最小，要求透传≥100Hz(不足自动抬到100)。'
+                             '默认开；用 --no-high-follow 关(改回低跟随，控制器自规划更软)')
+    parser.add_argument('--traj-mode', type=int, default=VIVE_TRAJ_MODE, choices=[0, 1, 2],
+                        help='高跟随控制器侧轨迹平滑(治伺服嗡颤)：0=完全透传 1=曲线拟合 2=滤波(默认)，默认 %(default)s')
+    parser.add_argument('--traj-radio', type=int, default=VIVE_TRAJ_RADIO,
+                        help='轨迹平滑系数：拟合0~100/滤波0~1000，越大越平滑滞后越大，默认 %(default)s')
+    parser.add_argument('--oe-mincutoff', type=float, default=VIVE_OE_MINCUTOFF,
+                        help='One Euro 零速截止频率(Hz)，越低越压静止手抖(慢速滞后略增)，默认 %(default)s')
+    parser.add_argument('--oe-beta', type=float, default=VIVE_OE_BETA,
+                        help='One Euro 速度系数，越大快速运动越跟手；默认 %(default)s(刻意低=重阻尼防跟随太快)，嫌拖调大(经验10~30)')
     args = parser.parse_args()
 
     # 导入机械臂SDK
@@ -858,7 +997,14 @@ def main():
     # 初始化 Vive 遥控（未连接时会阻塞等待直到 Tracker 就绪，Ctrl+C 可中断）
     try:
         vive_ctrl = ViveController(arm, arm_lock, tracker_serial=args.tracker_serial,
-                                   enable_vive=not args.teaching)
+                                   enable_vive=not args.teaching,
+                                   control_hz=args.control_hz,
+                                   follow_high=args.high_follow,
+                                   traj_mode=args.traj_mode,
+                                   traj_radio=args.traj_radio,
+                                   oe_mincutoff=args.oe_mincutoff,
+                                   oe_beta=args.oe_beta,
+                                   oe_dcutoff=VIVE_OE_DCUTOFF)
     except KeyboardInterrupt:
         print("\n[!] 已取消：等待 Vive 连接被中断")
         cam_top.close()
