@@ -41,6 +41,7 @@
 - 🎮 **Vive 遥操作采集**：基于 OpenVR 的低延迟遥操作，支持示教模式（手动拖动）
 - 📷 **双相机系统**：顶部 RealSense D435 + 腕部奥比中光 Gemini 305，覆盖全局与精细观测
 - 🔧 **知行 RTU 夹爪**：独立串口异步控制，与机械臂解耦，不阻塞主循环
+- ✊ **Pika 主手夹爪**（默认启用）：手持主手开合遥操从手夹爪，为夹爪首选控制源（与键盘互斥，开启遥操后生效）
 - 🧠 **多策略支持**：一套数据，多种策略对比训练
 - ⚡ **优化推理**：EMA 平滑 + 死区过滤 + Temporal Ensemble
 
@@ -66,6 +67,7 @@
 |------|------|------|
 | 机械臂 | 睿尔曼 RM65-B | 6自由度，TCP/IP通信（IP 192.168.5.123） |
 | 夹爪 | 知行 RTU 平动手 | Modbus RTU，独立串口 `/dev/realman/gripper_left` |
+| 主手夹爪（默认启用） | Pika Sense | 串口 `/dev/tty_pika_left`；默认开且为夹爪首选控制源（`--no-pika-gripper` 关），与键盘互斥 |
 | 遥操作 | Vive Tracker (Pika Sense viva) | OpenVR/SteamVR |
 | 顶部相机 | Intel RealSense D435 | 640×480@30fps |
 | 腕部相机 | 奥比中光 Gemini 305 | 640×480@30fps (pyorbbecsdk) |
@@ -124,6 +126,7 @@ lerobot-realman-vla/
 │   ├── vive_tracker.py           # Vive Tracker OpenVR接口
 │   ├── orbbec_camera.py          # 腕部相机 奥比中光 Gemini 305 (pyorbbecsdk)
 │   ├── changingtek_gripper.py    # 知行 RTU 夹爪归一化封装
+│   ├── pika_gripper.py           # Pika Sense 主手夹爪封装（默认首选控制源）
 │   └── README.md                 # 硬件配置指南
 │
 ├── docs/                         # 📚 技术文档

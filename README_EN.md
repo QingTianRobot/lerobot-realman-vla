@@ -25,6 +25,7 @@ This project implements a complete imitation learning pipeline for the **RealMan
 - 🎮 **Vive Teleoperation**: Low-latency teleoperation via OpenVR, with teaching mode fallback
 - 📷 **Dual Camera System**: RealSense top + wrist cameras for global and fine-grained observation
 - 🔧 **Async Modbus Gripper**: Non-blocking gripper control that doesn't affect control frequency
+- ✊ **Pika Master Gripper** (enabled by default): Teleoperate the arm gripper with a handheld Pika Sense master as the primary gripper control source (mutually exclusive with the keyboard; active only while arm teleop is enabled)
 - 🧠 **Multi-Policy Support**: One dataset, multiple policy comparisons
 - ⚡ **Optimized Inference**: EMA smoothing + deadzone filtering + temporal ensemble
 
@@ -36,6 +37,7 @@ This project implements a complete imitation learning pipeline for the **RealMan
 |-----------|-------|-------------|
 | Robot Arm | RealMan RM65-B | 6-DOF, TCP/IP communication |
 | Gripper | FAE2M86C | Modbus RTU protocol |
+| Master Gripper (default on) | Pika Sense | Serial `/dev/tty_pika_left`; primary gripper control source (disable with `--no-pika-gripper`), mutually exclusive with keyboard |
 | Teleoperation | HTC Vive Tracker 3.0 | OpenVR/SteamVR |
 | Top Camera | Intel RealSense D435i | 640×480@30fps |
 | Wrist Camera | Intel RealSense D435i | 640×480@30fps |

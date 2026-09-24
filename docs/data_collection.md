@@ -17,6 +17,7 @@
 | 顶部相机 | Intel RealSense D435 | 序列号 `262322074840` |
 | 腕部相机 | 奥比中光 Gemini 305 | 序列号 `CV2T66100096` |
 | 遥操作 | Vive Tracker (Pika Sense viva) | 序列号可选，单 tracker 自动选第一个 |
+| 主手夹爪（默认启用） | Pika Sense | 串口 `/dev/tty_pika_left`；默认开且为夹爪首选控制源（`--no-pika-gripper` 关），与键盘互斥 |
 
 **夹爪归一化约定**（采集/推理必须一致）：第 7 维 `0~1`，**`1=张开`、`0=闭合`**；推理端 `>0.5 判为开`。
 
@@ -161,6 +162,8 @@ python scripts/collect_data.py \
     --save-dir data/raw_hdf5 --task-name pick_cube --fps 30
 ```
 
+> **Pika 主手夹爪默认启用且为夹爪首选控制源**（连不上自动回退键盘）；不用加 `--no-pika-gripper`，可选 `--pika-port` / `--pika-hz`。需按 `w` 开启遥操后夹爪才跟随主手，按 `p` 可与键盘互斥切换，详见 [5.1](#51-pika-主手夹爪默认启用的首选夹爪控制源)。
+
 启动后逐项确认状态行；Vive 就绪后会**自动慢速归位到 `ROBOT_INIT`**（3 秒倒计时，请清空机械臂周围；**若机械臂本就在 `ROBOT_INIT` 附近——位置<2cm 且姿态<5°——则自动跳过、不做无谓的慢速运动**），随后打印单键命令表（无需回车）：
 
 ```
@@ -183,6 +186,7 @@ Vive: OK
   [1] 夹爪 30%
   [2] 夹爪 60%
   [3] 夹爪 100%
+  [p] 夹爪控制源 Pika主手/键盘 切换(互斥)
   [q] 退出
   [Ctrl+C] 强制退出
 --------------------------------------------------
@@ -205,9 +209,34 @@ Vive: OK
 | `1`/`2`/`3` | 夹爪预设开度 | 分别 30%/60%/100%；百分比在 `keybindings.json` 的 `args.pct` 自定义 |
 | `c` | 夹爪闭合 | 等价 0% |
 | `o` | 夹爪张开 | 等价 100% |
+| `p` | 夹爪控制源 **Pika主手/键盘** 切换 | 默认 Pika 主手；互斥切换（`--no-pika-gripper` 时仅键盘），见 [5.1](#51-pika-主手夹爪默认启用的首选夹爪控制源) |
 | `q` | 退出 | 自动松夹爪、断连、关相机 |
 
-> 机械臂位姿由 **Vive tracker** 控制，夹爪由 **键盘 `1`/`2`/`3`/`c`/`o`** 控制（tracker 不管夹爪）。
+> 机械臂位姿由 **Vive tracker** 控制，夹爪默认由 **Pika 主手**控制（需按 `w` 开启遥操后跟随；按 `p` 可切到键盘 `1`/`2`/`3`/`c`/`o`，见 5.1）（tracker 不管夹爪）。
+
+### 5.1 Pika 主手夹爪（默认启用的首选夹爪控制源）
+
+除键盘外，可用 **Pika Sense 手持主手夹爪**的开合来遥操作机械臂从手夹爪，与键盘控制**互斥**。封装见 [`hardware/pika_gripper.py`](../hardware/pika_gripper.py)，驱动来自 submodule `vendor/pika_sdk`。
+
+**主从映射**：主手 `get_gripper_distance()`（mm，0=闭合→~109=全开）→ 归一化 `v = clamp((d-min_mm)/(max_mm-min_mm),0,1)` → 从手 `move_normalized(v)`。两者方向一致，无需反转。
+
+**① 标定行程**（强烈建议一次；未标定用理论 `0~109mm` 兜底、精度差）：
+```bash
+python hardware/pika_gripper.py --calibrate   # 按提示先【完全闭合】再【完全张开】各采一点
+python hardware/pika_gripper.py               # 自检：实时打印 行程(mm) 与归一化值
+```
+结果写入 `hardware/pika_calibration.json`（机器相关，已 `.gitignore`），自检与采集自动加载。
+
+**② 采集时启用**（默认已开，无需额外参数）：
+```bash
+python scripts/collect_data.py [--pika-port /dev/tty_pika_left] [--pika-hz 30] ...   # 默认已启用 Pika
+python scripts/collect_data.py --no-pika-gripper ...                                # 不用 Pika，仅键盘
+```
+- **默认启用且为夹爪首选控制源**（`gripper_source=pika`）；连不上时自动回退键盘。按 `p` 在 `Pika主手 ↔ 键盘` 间互斥切换（状态行显示当前控制源）。
+- **需开启遥操才控夹爪**：仅当机械臂遥操已启用（按 `w`）时，后台线程才按 `--pika-hz`（默认 30Hz）把主手行程写到从手；暂停遥操（再按 `w`/`s`/`h`）夹爪同步停写。变化 < 死区（默认 0.02）不重复下发。示教模式无遥操概念，不门控。
+- Pika 为控制源时键盘 `o/c/1/2/3` 被拦截；切回键盘则 Pika 线程停写、键盘恢复。
+- ⚠️ 遥操开启的**瞬间从手会立即对齐主手当前开合**（主手在最大张开则从手张开到底，属预期）；按 `w` 前先把主手摆到期望开度。
+- 录制记录的是从手**实际反馈**位置，与控制源无关，键盘/Pika 采出的数据第 7 维语义一致，转换/训练流程无需改动。
 
 ---
 

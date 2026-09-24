@@ -36,6 +36,7 @@ python scripts/collect_data.py \
 | `h` | 复位 | 常速归位到 `ROBOT_INIT`；执行前自动暂停遥操；**录制中也可复位**（仅 Vive 模式） |
 | `1`/`2`/`3` | 夹爪预设开度 | 30%/60%/100%，可在 [`configs/keybindings.json`](../configs/keybindings.json) 自定义 |
 | `c` / `o` | 夹爪闭合 / 张开 | 0% / 100% |
+| `p` | 夹爪控制源 Pika主手/键盘 切换 | 默认 Pika 主手（互斥）；需按 `w` 开启遥操后夹爪才跟随，见 [数据采集指南 5.1](data_collection.md#51-pika-主手夹爪默认启用的首选夹爪控制源) |
 | `q` | 退出 | |
 
 > 单键即触发（无需回车）；按键表见 [`configs/keybindings.json`](../configs/keybindings.json)，terminal 与后续 web 前端共用。

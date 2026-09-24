@@ -83,6 +83,42 @@ g.disable(); g.disconnect()
 
 ---
 
+## 主手夹爪 — Pika Sense (可选第二套夹爪控制源)
+
+采集时除键盘 `o/c/1/2/3` 外，可用 **Pika Sense 手持主手夹爪**开合来遥操作机械臂从手夹爪。
+封装见 `hardware/pika_gripper.py`（只读 Sense 的开合行程，不启用其相机/IMU/Vive）；
+驱动来自 submodule `vendor/pika_sdk`，运行期只需 `pyserial`。
+
+### 主从映射
+| 角色 | 设备 | 接口 | 语义 |
+|------|------|------|------|
+| 主手(输入) | Pika Sense `/dev/tty_pika_left` | `get_gripper_distance()` (mm) | 0mm=闭合 → ~109mm=全开 |
+| 从手(输出) | 知行夹爪 `/dev/realman/gripper_left` | `move_normalized(v)` | v=0 闭合, v=1 张开 |
+
+映射：`v = clamp((d_mm - min_mm) / (max_mm - min_mm), 0, 1)`。主手与从手方向一致，**默认不反转**
+（从手 `invert=True` 的物理反向已在知行封装内部处理）；若某台 Sense 读数方向相反，构造时置 `invert=True`。
+
+### 行程标定（强烈建议一次）
+Sense 编码器零点/行程因个体而异，未标定时用理论行程 `0~109mm` 兜底（精度差）：
+```bash
+python hardware/pika_gripper.py --calibrate     # 按提示先【完全闭合】再【完全张开】各采一点
+python hardware/pika_gripper.py                 # 自检: 实时打印 行程(mm) 与归一化值
+```
+标定写入 `hardware/pika_calibration.json`（按 name 索引，机器相关，已 `.gitignore`）；自检与采集自动加载，基准一致。
+
+### 采集时启用（默认开、首选控制源、与键盘互斥）
+```bash
+python scripts/collect_data.py [--pika-port /dev/tty_pika_left] [--pika-hz 30] ...   # 默认已启用 Pika
+python scripts/collect_data.py --no-pika-gripper ...                                # 不用 Pika, 仅键盘
+```
+- **默认启用且为夹爪首选控制源**（`gripper_source=pika`）；连不上时自动回退到键盘。按 `p`（`toggle_gripper_source`）在 `Pika主手 ↔ 键盘` 间互斥切换。
+- **需开启遥操才控夹爪**：仅当机械臂遥操已启用（按 `w`）时，后台线程 `PikaGripperTeleop` 才按 `--pika-hz`(默认 30Hz) 把主手行程写到从手；暂停遥操（再按 `w`/`s`/`h`）夹爪同步停写。变化 < 死区(默认 0.02) 不重复下发（减少 RTU 总线写入）。示教模式无遥操概念，不门控。
+- Pika 为控制源时键盘 `o/c/1/2/3` 被拦截；切回键盘则 Pika 线程停写、键盘恢复。
+- ⚠ 遥操开启的瞬间从手会**立即对齐主手当前开合**（主手在最大张开则从手张开到底，属预期）；按 `w` 前先把主手摆到期望开度。
+- 录制记录的是从手**实际反馈**位置（`get_position_normalized()`），与控制源无关，数据语义一致。
+
+---
+
 ## 相机 — 顶部 D435 (RealSense) + 腕部 Gemini 305 (Orbbec)
 
 ### 双相机配置
