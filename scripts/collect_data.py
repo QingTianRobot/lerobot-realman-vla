@@ -202,6 +202,7 @@ class ViveController:
         self.tracker_serial = tracker_serial or DEFAULT_TRACKER_SERIAL
         self.enable_vive = enable_vive
 
+        # 遥操基点(位置/姿态): 初值用全局 ROBOT_INIT 兜底, 每次 enable() 会改绑到机械臂"当前"位姿
         self.robot_init_pos = ROBOT_INIT_POS.copy()
         self.robot_init_ori = ROBOT_INIT_ORI.copy()
         # 起始姿态的旋转矩阵形式 (固定轴 XYZ/RPY: R = Rz·Ry·Rx)
@@ -315,15 +316,37 @@ class ViveController:
         self.vive_init_R = _quat_to_matrix(q_mean / np.linalg.norm(q_mean))
         return True
 
+    def _read_arm_pose(self):
+        """读机械臂当前笛卡尔位姿 [x,y,z, rx,ry,rz] (米/弧度); 失败返回 None。"""
+        try:
+            with self.arm_lock:
+                code, state = self.arm.rm_get_current_arm_state()
+            if code == 0 and state and state.get("pose"):
+                return [float(x) for x in state["pose"][:6]]
+        except Exception as e:  # noqa: BLE001 - 读状态失败不应中断
+            print(f"[!] 读机械臂当前位姿失败: {e}")
+        return None
+
     def enable(self):
-        """启用遥操: 每次以当前 Tracker 位置为零点(免手动校准), 随后开始跟随。"""
+        """启用遥操: 同时捕获「Tracker 当前位姿=零点」与「机械臂当前位姿=基点」。
+
+        基点绑定机械臂"当前"位置(而非全局 ROBOT_INIT), 故按下 w 时机械臂原地 engage、
+        不会突跳到 ROBOT_INIT; 手的相对运动从当前位置开始映射。
+        """
         if self.tracker is None:
             print("[!] Vive 未连接, 无法启用遥操")
             return
-        if not self.calibrate():       # 以当前手持位置作为校准零点
+        if not self.calibrate():       # Tracker 零点 = 当前手持位置
             return
+        arm_pose = self._read_arm_pose()   # 机械臂基点 = 当前位姿 (不绑定 ROBOT_INIT)
+        if arm_pose is None:
+            print("[!] 读不到机械臂当前位姿, 无法启用遥操")
+            return
+        self.robot_init_pos = np.array(arm_pose[:3])
+        self.robot_init_ori = np.array(arm_pose[3:6])
+        self.robot_init_R = _euler_xyz_to_matrix(self.robot_init_ori)
         self.control_enabled = True
-        print("遥控已启用 (零点=当前 Tracker 位置)")
+        print("遥控已启用 (Tracker 零点=当前手持位, 机械臂基点=当前位姿)")
 
     def disable(self):
         self.control_enabled = False

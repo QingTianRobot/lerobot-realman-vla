@@ -31,7 +31,7 @@ python scripts/collect_data.py \
 
 | 按键 | 功能 | 备注 |
 |------|------|------|
-| `w` | 遥控 开/关（toggle） | 启用时**自动以当前 Tracker 位置为零点**，无需单独校准（仅 Vive 模式） |
+| `w` | 遥控 开/关（toggle） | 启用时**以当前 Tracker 位为零点、机械臂当前位姿为基点**，原地 engage 不突跳（仅 Vive 模式） |
 | `s` | 录制 开始/保存（toggle） | 单键切换开始 / 停止并保存 |
 | `h` | 复位 | 常速归位到 `ROBOT_INIT`；执行前自动暂停遥操（仅 Vive 模式） |
 | `1`/`2`/`3` | 夹爪预设开度 | 30%/60%/100%，可在 [`configs/keybindings.json`](../configs/keybindings.json) 自定义 |
