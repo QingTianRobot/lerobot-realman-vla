@@ -104,7 +104,7 @@ python hardware/vive_tracker.py   # 打印发现的设备(hmd/tracker/基站)与
 实测机械开/合限位，避免命令顶到硬限位长期堵转发热；结果写入 `hardware/gripper_calibration.json`，**采集与推理会自动加载**，保证三端行程一致。
 
 ```bash
-python hardware/changingtek_gripper.py --slave-id 2 --calibrate --margin 0.02
+python hardware/changingtek_gripper.py --slave-id 2 --calibrate --margin 0.002
 ```
 - 会驱动到开/合限位实测真实行程，上限回缩 `margin`（默认 2%）后持久化。
 - 标定前**确保夹爪周围无障碍**。
