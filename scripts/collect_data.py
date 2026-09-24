@@ -64,6 +64,10 @@ GRIPPER_RESET_TIMEOUT = 3.0   # 复位等待到位超时(秒): 超时仅告警, 
 PIKA_GRIPPER_PORT = "/dev/tty_pika_left"   # 见 /etc/udev/rules.d/98-usb-serial.rules 的 PIKA_LEFT
 PIKA_TELEOP_HZ = 30          # 主手→从手映射下发频率(Hz); 从手 move_normalized 异步覆盖式下发, 总线按其 poll_hz 消费
 PIKA_TELEOP_DEADBAND = 0.02  # 归一化死区: 变化<此值不重复下发, 减少知行 RTU 总线写入
+# 从手逼近主手的归一化限速 (单位/秒): 全程 0→1 约 1/rate 秒。把「engage 瞬间从手立即对齐
+# 主手当前开合」的突跳摊成一段平滑斜坡 (刚开启遥操时以从手当前实际位置为起点逐步逼近),
+# 正常跟随时也起限速平滑作用。≤0 关闭限速 (退回原来的瞬间对齐)。
+PIKA_TELEOP_RAMP_RATE = 2.5
 
 # 机械臂初始位姿（Vive遥操作零点对应的机械臂笛卡尔位姿）
 # 含义: 按 v 校准零点后, tracker 在零点时机械臂应处的位姿; 按 w 启用后机械臂以此为基础跟随。
@@ -579,40 +583,63 @@ class PikaGripperTeleop:
     (move_normalized 异步覆盖式下发, 由知行总线线程按 poll_hz 消费); 变化小于 deadband
     不重复下发, 减少 RTU 总线写入。即: 按 w 开启遥操→夹爪跟随主手, 暂停遥操→夹爪停写。
 
+    限速斜坡(ramp_rate): 刚 engage 时从手与主手开度往往不一致, 若直接对齐会造成夹爪
+    瞬间突跳(可能夹手/撞到物体、并在录制里留下一段快变)。故开启遥操时以从手当前
+    实际位置为起点, 每步最多变化 ramp_rate/hz 逐步逼近主手, 把突跳摊成平滑斜坡。
+
     teleop_gate: 无参可调用返回 bool, 判断机械臂遥操是否开启; None 表示不门控(如示教模式)。
     """
 
     def __init__(self, master, gripper, hz=PIKA_TELEOP_HZ, deadband=PIKA_TELEOP_DEADBAND,
-                 teleop_gate=None):
+                 ramp_rate=PIKA_TELEOP_RAMP_RATE, teleop_gate=None):
         self.master = master
         self.gripper = gripper
         self.hz = max(1.0, float(hz))
         self.deadband = max(0.0, float(deadband))
+        # 归一化行程限速(单位/秒): 限制从手每步逼近主手的最大变化, ≤0 关闭限速。
+        self.ramp_rate = float(ramp_rate)
         self.teleop_gate = teleop_gate
         self.enabled = False       # 仅在被设为当前夹爪控制源时写从手
         self.running = True
-        self._last_v = None
+        self._cmd_v = None         # 限速斜坡的当前指令值(归一化); None=尚未 engage
+        self._last_sent = None     # 上一次真正下发到总线的值 (死区判断用)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def _loop(self):
         interval = 1.0 / self.hz
+        # 每步最大变化量: 全程 0→1 需 1/ramp_rate 秒; ramp_rate≤0 时不限速(直接对齐主手)
+        max_step = self.ramp_rate * interval if self.ramp_rate > 0 else None
         last_err = None
         while self.running:
             time.sleep(interval)
             # 双重门控: 被选为控制源 且 (无门控 或 机械臂遥操已开启) 才写从手
             gate_open = self.teleop_gate is None or bool(self.teleop_gate())
             if not self.enabled or not gate_open:
-                self._last_v = None   # 未接管/遥操暂停期间清缓存, 重新生效时立即下发一次对齐主手
+                # 未接管/遥操暂停: 清斜坡状态; 下次 engage 从从手「当前实际位置」起步平滑对齐, 不突跳
+                self._cmd_v = None
+                self._last_sent = None
                 continue
             try:
-                v = self.master.get_normalized()
-                if v is None:
+                target = self.master.get_normalized()
+                if target is None:
                     continue
-                if self._last_v is not None and abs(v - self._last_v) < self.deadband:
+                if self._cmd_v is None:
+                    # 刚 engage: 以从手当前反馈位置为斜坡起点 (而非直接跳到主手值), 消除瞬间突跳
+                    self._cmd_v = self.gripper.get_position_normalized()
+                if max_step is not None:
+                    delta = target - self._cmd_v
+                    if abs(delta) <= max_step:
+                        self._cmd_v = target
+                    else:
+                        self._cmd_v += math.copysign(max_step, delta)
+                else:
+                    self._cmd_v = target
+                # 死区: 与上次下发值变化过小则不重复写 RTU 总线
+                if self._last_sent is not None and abs(self._cmd_v - self._last_sent) < self.deadband:
                     continue
-                self.gripper.move_normalized(v)
-                self._last_v = v
+                self.gripper.move_normalized(self._cmd_v)
+                self._last_sent = self._cmd_v
             except Exception as e:  # noqa: BLE001 - 遥操线程不能因单次异常中断
                 if str(e) != last_err:
                     print(f"[!] Pika 夹爪遥操异常: {e}")
@@ -1079,6 +1106,9 @@ def main():
                         help='Pika Sense 串口(默认 %(default)s)')
     parser.add_argument('--pika-hz', type=float, default=PIKA_TELEOP_HZ,
                         help='Pika 主手→从手映射下发频率(Hz), 默认 %(default)s')
+    parser.add_argument('--pika-ramp-rate', type=float, default=PIKA_TELEOP_RAMP_RATE,
+                        help='从手逼近主手的归一化限速(单位/秒): 全程 0→1 约 1/rate 秒, '
+                             '把开启遥操瞬间的夹爪突跳摊成平滑斜坡; ≤0 关闭限速, 默认 %(default)s')
     parser.add_argument('--save-dir', type=str, default='data/raw_hdf5', help='数据保存目录')
     parser.add_argument('--task-name', type=str, default='task_pick_cube', help='任务名称')
     parser.add_argument('--fps', type=int, default=30, help='采集帧率')
@@ -1175,6 +1205,7 @@ def main():
             # 示教模式无遥操概念, 不门控(gate=None), 夹爪随控制源生效。
             teleop_gate = None if args.teaching else (lambda: vive_ctrl.control_enabled)
             pika_teleop = PikaGripperTeleop(pika_master, gripper, hz=args.pika_hz,
+                                            ramp_rate=args.pika_ramp_rate,
                                             teleop_gate=teleop_gate)
             if args.teaching:
                 print("[i] 夹爪控制源默认 Pika 主手 (示教模式无遥操门控; 按 p 切到键盘)")
