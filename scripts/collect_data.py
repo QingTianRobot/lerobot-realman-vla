@@ -690,24 +690,33 @@ class CollectorController:
         self.print_status()
 
     def action_toggle_record(self, **_):
-        """单键 toggle: 录制 开始<->停止并保存 (原 s/d 合并), 自动递增文件名。"""
+        """单键 toggle: 录制 开始<->停止并保存 (原 s/d 合并), 自动递增文件名。
+
+        停止(保存)后立即暂停遥操: 保存完机械臂不再跟随手, 便于复位/摆场景、也防误动;
+        下一条 episode 需重新按 w 启用(会以机械臂当前位姿重新取零点)。
+        """
         if self.recorder.is_recording:
             self.recorder.stop()
             self.saved_count += 1
+            if not self.teaching and self.vive.control_enabled:
+                self.vive.disable()
+                print("[i] 录制结束已保存, 遥操已自动暂停 (下条按 w 重新启用)")
         else:
             filename = get_next_filename(self.save_dir, self.task_name)
             self.recorder.start(filename)
         self.print_status()
 
     def action_reset_arm(self, **_):
-        """复位键: 常速归位到 ROBOT_INIT。复位前自动暂停遥操 (需手动重新启用)。"""
-        if self.recorder.is_recording:
-            print("[!] 录制中无法复位, 请先停止录制 (s)")
-            return
+        """复位键: 常速归位到 ROBOT_INIT。复位前自动暂停遥操 (需手动按 w 重新启用)。
+
+        录制中也允许复位: 归位运动会照常录进当前 episode (按需求不拦截)。
+        """
         if not self.teaching and self.vive.control_enabled:
             self.vive.disable()
             time.sleep(0.15)   # 等一个控制周期, 让在途透传指令发完, 避免与归位争锁后补发旧位姿
-            print("[i] 复位前已暂停遥操; 如需遥操请重新校准 (v) 后启用 (w)")
+            print("[i] 复位前已暂停遥操; 如需遥操请按 w 重新启用 (自动取当前位姿为零点)")
+        if self.recorder.is_recording:
+            print("[i] 录制中复位: 归位运动会录进当前 episode")
         self.move_to_init(ARM_HOME_SPEED_NORMAL, block=1, countdown=0, label="复位")
         self.print_status()
 
