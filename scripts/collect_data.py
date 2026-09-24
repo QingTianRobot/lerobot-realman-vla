@@ -74,10 +74,10 @@ VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw
 ARM_HOME_SPEED_SLOW = 10     # 启动慢速归位速度百分比 v(1~100): 上电位姿未知, 求稳
 ARM_HOME_SPEED_NORMAL = 45   # 复位键常速归位速度百分比
 ARM_HOME_COUNTDOWN = 3       # 启动归位前倒计时秒数, 留时间清空机械臂周围
-# 运行模式: 规划运动(movej_p)用自动模式; CANFD 遥操透传(movep_canfd)沿用现有模式 1。
-# 归位期间临时切自动模式、完成后切回, 两端互不影响 (归位时遥操必为暂停)。
-ARM_RUN_MODE_AUTO = 0
-ARM_RUN_MODE_TELEOP = 1
+# ⚠️ rm_set_arm_run_mode 是"仿真(0)/真实(1)"开关, 不是运动模式! 全程保持真实(1):
+#    规划运动(rm_movej_p)与 CANFD 透传(rm_movep_canfd)都在真实模式下执行, 归位无需切模式
+#    (切到 0=仿真会让指令只在仿真里跑、真实机械臂不动 —— 这正是"归位没反应"的坑)。
+VIVE_CALIB_FRAMES = 5        # 启用遥操时自动校准零点的平均帧数 (原 30 帧太长, 现取当前手持位)
 # ============ 配置区域结束 ============
 
 
@@ -283,16 +283,20 @@ class ViveController:
                 first = device
         return first
 
-    def calibrate(self):
-        """校准：记录当前 Vive Tracker 位姿作为零点"""
+    def calibrate(self, frames=None):
+        """以当前 Vive Tracker 位姿为零点。frames=平均帧数(默认 VIVE_CALIB_FRAMES)。
+
+        启用遥操(enable)时自动调用: 每次都以"当前手持位置"为零点, 无需单独手动校准、
+        也不必记住某个全局固定零点。少量帧平均仅用于抑制单帧抖动/丢帧。
+        """
         if self.tracker is None:
             print("[!] Vive 未连接")
             return False
 
-        print("校准中... 保持 Tracker 静止")
+        frames = VIVE_CALIB_FRAMES if frames is None else max(1, int(frames))
         positions = []
         quats = []          # [w,x,y,z]
-        for _ in range(30):
+        for _ in range(frames):
             pose = self.tracker.get_pose_quaternion()   # [x,y,z, w,qx,qy,qz]
             if pose:
                 positions.append([pose[0], pose[1], pose[2]])
@@ -300,24 +304,26 @@ class ViveController:
                 if quats and np.dot(q, quats[0]) < 0:
                     q = -q  # 统一到同一半球, 避免四元数符号翻转导致平均抵消
                 quats.append(q)
-            time.sleep(0.033)
+            time.sleep(0.02)
 
         if not quats:
-            print("[!] 校准失败")
+            print("[!] 校准失败: 读不到 Tracker 位姿")
             return False
 
         self.vive_init_pos = np.mean(positions, axis=0)
         q_mean = np.mean(quats, axis=0)
         self.vive_init_R = _quat_to_matrix(q_mean / np.linalg.norm(q_mean))
-        print("校准完成")
         return True
 
     def enable(self):
-        if self.vive_init_pos is None:
-            print("请先校准(v)")
+        """启用遥操: 每次以当前 Tracker 位置为零点(免手动校准), 随后开始跟随。"""
+        if self.tracker is None:
+            print("[!] Vive 未连接, 无法启用遥操")
+            return
+        if not self.calibrate():       # 以当前手持位置作为校准零点
             return
         self.control_enabled = True
-        print("遥控已启用")
+        print("遥控已启用 (零点=当前 Tracker 位置)")
 
     def disable(self):
         self.control_enabled = False
@@ -506,8 +512,7 @@ class DataRecorder:
 # 字段: key=单键; action=动作名(对应 CollectorController.action_<name>);
 #       args=动作参数(可选); label=界面显示; modes=可选["vive"|"teaching"](缺省=通用)。
 FALLBACK_BINDINGS = [
-    {"key": "v", "action": "calibrate_vive", "label": "校准 Vive 零点", "modes": ["vive"]},
-    {"key": "w", "action": "toggle_teleop",  "label": "遥控 开/关",     "modes": ["vive"]},
+    {"key": "w", "action": "toggle_teleop",  "label": "遥控 开/关(自动取当前Tracker为零点)", "modes": ["vive"]},
     {"key": "s", "action": "toggle_record",  "label": "录制 开始/保存"},
     {"key": "h", "action": "reset_arm",      "label": "复位到起始位(常速)"},
     {"key": "o", "action": "gripper_open",   "label": "夹爪张开"},
@@ -592,8 +597,8 @@ class CollectorController:
     def move_to_init(self, speed, block=1, countdown=0, label="归位"):
         """rm_movej_p 关节空间规划到 ROBOT_INIT (大位移最稳、不撞奇异点)。
 
-        规划运动需自动模式(ARM_RUN_MODE_AUTO); 遥操 CANFD 透传用模式 1, 故归位期间
-        临时切自动模式、完成后切回, 两端互不影响 (归位时遥操必为暂停)。
+        机械臂全程处于真实模式(run_mode=1), 规划运动直接执行即可 —— 切勿切到
+        run_mode=0(那是"仿真"模式, 指令只在仿真里跑、真实机械臂不动)。
         失败仅打印告警、不下发危险运动; ret!=0 多为位姿不可达, 见 ROBOT_INIT 标定。
         """
         if countdown > 0:
@@ -601,12 +606,8 @@ class CollectorController:
             for i in range(countdown, 0, -1):
                 print(f"    {i}...", flush=True)
                 time.sleep(1.0)
-        self.arm.rm_set_arm_run_mode(ARM_RUN_MODE_AUTO)
-        try:
-            with self.arm_lock:
-                ret = self.arm.rm_movej_p(self.robot_init_pose, int(speed), 0, 0, int(block))
-        finally:
-            self.arm.rm_set_arm_run_mode(ARM_RUN_MODE_TELEOP)
+        with self.arm_lock:
+            ret = self.arm.rm_movej_p(self.robot_init_pose, int(speed), 0, 0, int(block))
         if ret != 0:
             print(f"[!] {label}失败: rm_movej_p ret={ret} (位姿可能不可达, 检查 ROBOT_INIT 标定)")
             return False

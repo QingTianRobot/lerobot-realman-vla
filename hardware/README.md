@@ -246,7 +246,6 @@ Vive → Robot:
 
 ### 校准流程
 0. **首次/换硬件**：手动把臂拖到遥操起始位 → `python hardware/realman_arm.py --read-init --write` 写入 `ROBOT_INIT_POS/ORI`（tracker 零点对应的机械臂位姿）
-1. 将 Tracker 放到对应上一步起始位的固定姿态
-2. 按 `v` 校准（记录零点）
-3. 按 `w` 启用遥控
-4. 移动 Tracker 控制机械臂
+1. 手持 Tracker 到顺手的起始姿态（机械臂此时应在 `ROBOT_INIT`）
+2. 按 `w` 启用遥控 —— **自动以当前 Tracker 位置为零点**（无需单独校准键）
+3. 移动 Tracker 控制机械臂；再按 `w` 暂停
