@@ -53,6 +53,7 @@ GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准 (需与采集时一致)
 GRIPPER_SPEED_PCT = 100       # 电机行程速度(0~100); ⚠ 必须与采集端(collect_data --gripper-speed)一致, 否则开合动态与训练数据不符
 GRIPPER_POLL_HZ = 25          # RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz
+GRIPPER_BIN_THRESHOLD = 0.1   # 夹爪二值化阈值: 模型输出归一化位置 > 该值判为开, 否则判为闭
 
 # 与 collect_data.py ROBOT_INIT_POS + ROBOT_INIT_ORI 保持一致 (笛卡尔位姿 [x,y,z,rx,ry,rz], 米/弧度)
 INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.float32)
@@ -222,7 +223,7 @@ class RobotController:
                 self._last_joint_cmd = joint_target.copy()
 
             # 夹爪（知行 RTU 已内部异步下发，无需再起线程）
-            gripper_binary = 1 if qpos[6] > 0.5 else 0
+            gripper_binary = 1 if qpos[6] > GRIPPER_BIN_THRESHOLD else 0
             if self._last_gripper_cmd != gripper_binary:
                 self._last_gripper_cmd = gripper_binary
                 if gripper_binary:
@@ -412,7 +413,7 @@ def main():
             elapsed = time.time() - start_time
             if step_count % 10 == 0:
                 actual_freq = 1.0 / elapsed if elapsed > 0 else 0
-                gripper_state = "张开" if action[6] > 0.5 else "闭合"
+                gripper_state = "张开" if action[6] > GRIPPER_BIN_THRESHOLD else "闭合"
                 print(f"[{policy_type}] Step {step_count:4d} | "
                       f"J1:{qpos[0]:6.1f}→{action[0]:6.1f} | "
                       f"夹爪:{gripper_state} | {actual_freq:.1f}Hz")
