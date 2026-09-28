@@ -54,7 +54,7 @@ GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准 (需与采集时一致)
 GRIPPER_SPEED_PCT = 100       # 电机行程速度(0~100); ⚠ 必须与采集端(collect_data --gripper-speed)一致, 否则开合动态与训练数据不符
 GRIPPER_POLL_HZ = 25          # RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz
-GRIPPER_BIN_THRESHOLD = 0.1   # 夹爪二值化阈值: 模型输出归一化位置 > 该值判为开, 否则判为闭
+GRIPPER_DEADBAND = 0.02       # 与 collect_data.py 的 PIKA_TELEOP_DEADBAND 一致，减少无效 RTU 写入
 
 # 与 collect_data.py ROBOT_INIT_POS + ROBOT_INIT_ORI 保持一致 (笛卡尔位姿 [x,y,z,rx,ry,rz], 米/弧度)
 INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.float32)
@@ -194,16 +194,13 @@ class RobotController:
         self.ema_alpha = ema_alpha        # EMA 系数 (0.3=平滑, 0.7=响应快; 1.0=不平滑)
         self.joint_deadzone = joint_deadzone  # 死区阈值(度)
 
-    def get_qpos(self, skip_gripper=True):
+    def get_qpos(self):
         """获取当前 [6关节角 + 夹爪位置]"""
         with self.lock:
             joint_state = self.arm.rm_get_current_arm_state()
             joint_angles = joint_state[1]['joint'][:6]
-
-            if skip_gripper:
-                gripper_pos = 0.5 if self._last_gripper_cmd is None else float(self._last_gripper_cmd)
-            else:
-                gripper_pos = self.gripper.get_position_normalized()
+            # 与采集端一致：使用夹爪后台轮询到的实时归一化反馈，而非上一次命令值。
+            gripper_pos = self.gripper.get_position_normalized()
 
             return np.array(joint_angles + [gripper_pos], dtype=np.float32)
 
@@ -241,20 +238,19 @@ class RobotController:
                 self.arm.rm_movej(joint_target.tolist(), 50, 0, 0, 0)
                 self._last_joint_cmd = joint_target.copy()
 
-            # 夹爪（知行 RTU 已内部异步下发，无需再起线程）
-            gripper_binary = 1 if qpos[6] > GRIPPER_BIN_THRESHOLD else 0
-            if self._last_gripper_cmd != gripper_binary:
-                self._last_gripper_cmd = gripper_binary
-                if gripper_binary:
-                    self.gripper.open()
-                else:
-                    self.gripper.close()
+            # 夹爪（知行 RTU 内部异步下发）。与 collect_data 一样直接使用连续的
+            # 归一化目标：0=闭合、1=张开；死区仅用于避免重复写入 RS-485 总线。
+            gripper_target = float(np.clip(qpos[6], 0.0, 1.0))
+            if (self._last_gripper_cmd is None or
+                    abs(gripper_target - self._last_gripper_cmd) >= GRIPPER_DEADBAND):
+                self.gripper.move_normalized(gripper_target)
+                self._last_gripper_cmd = gripper_target
 
             return {
                 'cmd_joint': joint_target.copy(),
                 'sent': bool(should_send),
                 'target': raw_target,
-                'gripper_cmd': gripper_binary,
+                'gripper_cmd': gripper_target,
             }
 
     def move_to_init(self, init_pose):
@@ -536,7 +532,7 @@ def main():
                 wait_for_next_chunk(chunk_id + 1)
 
             # 获取观测
-            qpos = robot.get_qpos(skip_gripper=True)
+            qpos = robot.get_qpos()
             obs_timestamp = time.time()
             actual_joint = qpos[:6].copy()   # 观测时刻实测关节(=上一步 cmd 的执行结果)
             observation = {
@@ -602,13 +598,12 @@ def main():
             elapsed = time.time() - start_time
             if step_count % 1 == 0:
                 actual_freq = 1.0 / elapsed if elapsed > 0 else 0
-                gripper_state = "张开" if action[6] > GRIPPER_BIN_THRESHOLD else "闭合"
                 joints_str = " ".join(
                     f"J{i + 1}:{qpos[i]:6.1f}→{action[i]:6.1f}" for i in range(6)
                 )
                 print(f"[{policy_type}] Step {step_count:4d} | "
                       f"{joints_str} | "
-                      f"夹爪: {qpos[6]:5.2f}→{action[6]:5.2f}, {gripper_state} | {actual_freq:.1f}Hz")
+                      f"夹爪: {qpos[6]:5.2f}→{np.clip(action[6], 0.0, 1.0):5.2f} | {actual_freq:.1f}Hz")
 
             # 可视化
             if not args.headless:
