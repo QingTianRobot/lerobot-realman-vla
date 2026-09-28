@@ -1,5 +1,6 @@
 python scripts/collect_data.py \
-    --save-dir data/raw_hdf5/pick_plug --task-name pick_plug --fps 30
+    --save-dir data/raw_hdf5/test --task-name test --fps 30 \
+	--task "test"
 
 cd /home/robot/repo/lerobot-realman-vla
 export DISPLAY=:1 ; export XAUTHORITY=/run/user/1000/gdm/Xauthority
