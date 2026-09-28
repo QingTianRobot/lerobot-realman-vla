@@ -54,8 +54,8 @@ GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /1
 GRIPPER_SPEED_PCT = 100       # 电机行程速度(0~100); ⚠ 必须与采集端(collect_data --gripper-speed)一致, 否则开合动态与训练数据不符
 GRIPPER_POLL_HZ = 25          # RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz
 
-# 训练数据典型起始位姿（根据你的数据修改）
-INIT_POSE = np.array([-15.0, 3.0, 89.0, 0.5, 86.0, -15.0, 1.0], dtype=np.float32)
+# 与 collect_data.py ROBOT_INIT_POS + ROBOT_INIT_ORI 保持一致 (笛卡尔位姿 [x,y,z,rx,ry,rz], 米/弧度)
+INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.float32)
 
 # ------ 硬件模块路径 ------
 _HARDWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hardware')
@@ -231,11 +231,11 @@ class RobotController:
                     self.gripper.close()
 
     def move_to_init(self, init_pose):
-        """移动到初始位姿（阻塞）"""
+        """移动到初始位姿（阻塞）— 笛卡尔空间 movej_p, 与 collect_data 一致"""
         print(f"移动到初始位姿...")
-        self.arm.rm_movej(init_pose[:6].tolist(), 80, 0, 0, 1)
+        self.arm.rm_movej_p(init_pose[:6].tolist(), 80, 0, 0, 1)
 
-        self.gripper.move_normalized(float(init_pose[6]))
+        self.gripper.move_normalized(1.0)
         time.sleep(1.0)
 
     def stop(self):
