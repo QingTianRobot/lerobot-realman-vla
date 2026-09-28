@@ -159,7 +159,8 @@ python scripts/collect_data.py \
     --gripper-port /dev/realman/gripper_left --gripper-slave-id 2 \
     --cam-top 262322074840 --cam-wrist CV2T66100096 \
     --tracker-serial LHR-B909D55F \
-    --save-dir data/raw_hdf5/pick_plug --task-name pick_plug --fps 30
+    --save-dir data/raw_hdf5/pick_plug --task-name pick_plug --fps 30 \
+	--task "pick up the plug and place it in the box"
 ```
 
 > **Pika 主手夹爪默认启用且为夹爪首选控制源**（连不上自动回退键盘）；不用加 `--no-pika-gripper`，可选 `--pika-port` / `--pika-hz`。需按 `w` 开启遥操后夹爪才跟随主手，按 `p` 可与键盘互斥切换，详见 [5.1](#51-pika-主手夹爪默认启用的首选夹爪控制源)。
