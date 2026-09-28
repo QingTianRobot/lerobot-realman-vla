@@ -238,6 +238,21 @@ class RobotController:
         self.gripper.move_normalized(1.0)
         time.sleep(1.0)
 
+    def homing_on_exit(self, init_pose):
+        """退出前安全归位: 先停掉残留运动/清错误, 再 movej_p 回初始位姿并张开夹爪"""
+        try:
+            self.arm.rm_set_arm_stop()   # 取消推理循环遗留的排队运动指令
+            self.arm.rm_clear_system_err()
+            time.sleep(0.5)
+            self.move_to_init(init_pose)
+            print("机械臂已归位, 夹爪已张开")
+        except KeyboardInterrupt:
+            # 归位过程中再次 Ctrl+C: 立即急停, 不再继续归位
+            print("\n归位被中断, 急停")
+            self.stop()
+        except Exception as e:
+            print(f"[!] 退出归位失败: {type(e).__name__}: {e} (机械臂可能停留在当前位置)")
+
     def stop(self):
         try:
             self.arm.rm_set_arm_stop()
@@ -430,7 +445,8 @@ def main():
     except KeyboardInterrupt:
         print("\n\n推理终止")
     finally:
-        robot.stop()
+        # 退出前让机械臂回到 POS_INIT 并张开夹爪 (归位内部已含急停保护)
+        robot.homing_on_exit(INIT_POSE)
         try:
             if not args.headless:
                 cv2.destroyAllWindows()
