@@ -1,3 +1,6 @@
 [submodule "vendor/changingtek_rtu_sdk"]
 	path = vendor/changingtek_rtu_sdk
 	url = https://github.com/QingTianRobot/changingtek_rtu_sdk.git
+[submodule "vendor/pika_sdk"]
+	path = vendor/pika_sdk
+	url = https://github.com/agilexrobotics/pika_sdk.git

@@ -9,7 +9,7 @@
 归一化约定 (对外语义, 与数据第 7 维保持一致):
   v = 1.0 -> 张开
   v = 0.0 -> 闭合
-  推理端沿用 `>0.5 判为开` 的阈值。
+  采集与推理端均直接下发连续归一化目标值，不做开/闭二值化。
   ⚠ 本机知行平动手物理行程为「小端(min_position, mm≈0)=张开、大端(max_position, mm≈86)=闭合」,
   与归一化约定相反, 故默认 invert=True 在 归一化<->物理位置 间反转映射, 使
   v=0 真正驱动到物理闭合(大端)、v=1 到物理张开(小端)。换用方向相反的夹爪时置 invert=False。
@@ -50,7 +50,7 @@ class ChangingtekGripper:
 
     def __init__(self, port="/dev/realman/gripper_left", slave_id=2,
                  baudrate=115200, min_position=0, max_position=9000,
-                 name="left", poll_hz=25, speed_pct=50, force_pct=60,
+                 name="left", poll_hz=25, speed_pct=100, force_pct=60,
                  calibration_file=None, use_calibration=True, invert=True):
         self.port = port
         self.slave_id = int(slave_id)
@@ -329,6 +329,8 @@ if __name__ == "__main__":
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--max-position", type=int, default=9000)
     parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument("--speed", type=int, default=100,
+                        help="电机行程速度(0~100, 越大开合越快; 夹持力由 force_pct 独立限制), 默认 %(default)s")
     parser.add_argument("--calibrate", action="store_true",
                         help="驱动到开/合机械限位实测行程, 持久化标定到 gripper_calibration.json")
     parser.add_argument("--margin", type=float, default=0.02,
@@ -339,6 +341,7 @@ if __name__ == "__main__":
 
     g = ChangingtekGripper(port=args.port, slave_id=args.slave_id,
                            baudrate=args.baudrate, max_position=args.max_position,
+                           speed_pct=args.speed,
                            use_calibration=not args.no_calibration_file)
     print("连接:", g.connect())
     if not g.connected:

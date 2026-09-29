@@ -25,6 +25,7 @@ arm.rm_set_arm_run_mode(1)     # 设置运行模式
 |-----|------|------|
 | `rm_movej(joints, speed, 0, 0, 1)` | 关节空间运动 | 阻塞 |
 | `rm_movej(joints, speed, 0, 0, 0)` | 关节空间运动 | 非阻塞 |
+| `rm_movej_p(pose, speed, 0, 0, 1)` | 关节空间规划到笛卡尔位姿（采集脚本归位/复位，大位移最稳、不撞奇异点） | 阻塞 |
 | `rm_movep_canfd(pose, False, 0, 60)` | 笛卡尔空间CANFD | 非阻塞 |
 | `rm_get_current_arm_state()` | 获取当前状态 | - |
 
@@ -79,6 +80,42 @@ g.disable(); g.disconnect()
 ### 性能说明
 夹爪走独立串口，`request_move` 由所属总线的后台线程串行异步下发，**不阻塞主控制循环**；
 反馈按 `poll_hz`(默认 25Hz) 缓存，读取零阻塞。自检：`python hardware/changingtek_gripper.py`。
+
+---
+
+## 主手夹爪 — Pika Sense (可选第二套夹爪控制源)
+
+采集时除键盘 `o/c/1/2/3` 外，可用 **Pika Sense 手持主手夹爪**开合来遥操作机械臂从手夹爪。
+封装见 `hardware/pika_gripper.py`（只读 Sense 的开合行程，不启用其相机/IMU/Vive）；
+驱动来自 submodule `vendor/pika_sdk`，运行期只需 `pyserial`。
+
+### 主从映射
+| 角色 | 设备 | 接口 | 语义 |
+|------|------|------|------|
+| 主手(输入) | Pika Sense `/dev/tty_pika_left` | `get_gripper_distance()` (mm) | 0mm=闭合 → ~109mm=全开 |
+| 从手(输出) | 知行夹爪 `/dev/realman/gripper_left` | `move_normalized(v)` | v=0 闭合, v=1 张开 |
+
+映射：`v = clamp((d_mm - min_mm) / (max_mm - min_mm), 0, 1)`。主手与从手方向一致，**默认不反转**
+（从手 `invert=True` 的物理反向已在知行封装内部处理）；若某台 Sense 读数方向相反，构造时置 `invert=True`。
+
+### 行程标定（强烈建议一次）
+Sense 编码器零点/行程因个体而异，未标定时用理论行程 `0~109mm` 兜底（精度差）：
+```bash
+python hardware/pika_gripper.py --calibrate     # 按提示先【完全闭合】再【完全张开】各采一点
+python hardware/pika_gripper.py                 # 自检: 实时打印 行程(mm) 与归一化值
+```
+标定写入 `hardware/pika_calibration.json`（按 name 索引，机器相关，已 `.gitignore`）；自检与采集自动加载，基准一致。
+
+### 采集时启用（默认开、首选控制源、与键盘互斥）
+```bash
+python scripts/collect_data.py [--pika-port /dev/tty_pika_left] [--pika-hz 30] ...   # 默认已启用 Pika
+python scripts/collect_data.py --no-pika-gripper ...                                # 不用 Pika, 仅键盘
+```
+- **默认启用且为夹爪首选控制源**（`gripper_source=pika`）；连不上时自动回退到键盘。按 `p`（`toggle_gripper_source`）在 `Pika主手 ↔ 键盘` 间互斥切换。
+- **需开启遥操才控夹爪**：仅当机械臂遥操已启用（按 `w`）时，后台线程 `PikaGripperTeleop` 才按 `--pika-hz`(默认 30Hz) 把主手行程写到从手；暂停遥操（再按 `w`/`s`/`h`）夹爪同步停写。变化 < 死区(默认 0.02) 不重复下发（减少 RTU 总线写入）。示教模式无遥操概念，不门控。
+- Pika 为控制源时键盘 `o/c/1/2/3` 被拦截；切回键盘则 Pika 线程停写、键盘恢复。
+- ⚠ 遥操开启的瞬间从手会**立即对齐主手当前开合**（主手在最大张开则从手张开到底，属预期）；按 `w` 前先把主手摆到期望开度。
+- 录制记录的是从手**实际反馈**位置（`get_position_normalized()`），与控制源无关，数据语义一致。
 
 ---
 
@@ -245,7 +282,6 @@ Vive → Robot:
 
 ### 校准流程
 0. **首次/换硬件**：手动把臂拖到遥操起始位 → `python hardware/realman_arm.py --read-init --write` 写入 `ROBOT_INIT_POS/ORI`（tracker 零点对应的机械臂位姿）
-1. 将 Tracker 放到对应上一步起始位的固定姿态
-2. 按 `v` 校准（记录零点）
-3. 按 `w` 启用遥控
-4. 移动 Tracker 控制机械臂
+1. 手持 Tracker 到顺手的起始姿态（机械臂停在你希望开始的位置即可）
+2. 按 `w` 启用遥控 —— **以当前 Tracker 位为零点、机械臂当前位姿为基点**，原地 engage 不突跳（无需单独校准键）
+3. 移动 Tracker 控制机械臂；再按 `w` 暂停

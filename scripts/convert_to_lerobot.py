@@ -44,6 +44,10 @@ def convert_hdf5_episode(hdf5_path: Path):
             'camera_global': np.array(f['observations/images/camera_global']),    # (N, H, W, 3)
             'camera_left': np.array(f['observations/images/camera_left']),  # (N, H, W, 3)
         }
+        # 末端位姿为可选字段: 旧 HDF5 没有则跳过, 保持向后兼容。
+        # 直接从机械臂读取的 [x,y,z,rx,ry,rz] (米/弧度), 非解算。
+        if 'observations/ee_pose' in f:
+            data['ee_pose'] = np.array(f['observations/ee_pose'])   # (N, 6)
     return data
 
 
@@ -59,6 +63,13 @@ def main():
                         help="帧率，应与采集时一致（默认30）")
     parser.add_argument("--task", type=str, default="pick up the cube and place it in the basket",
                         help="任务描述（VLA策略需要，必须与推理时完全一致）")
+    parser.add_argument("--vcodec", type=str, default="h264",
+                        choices=["h264", "hevc", "libsvtav1"],
+                        help="视频编码器（默认 h264；LeRobot 默认的 libsvtav1/AV1 编码极慢，h264 快数倍）")
+    parser.add_argument("--image-writer-processes", type=int, default=4,
+                        help="并行写 PNG 帧的进程数（0=串行）")
+    parser.add_argument("--image-writer-threads", type=int, default=4,
+                        help="并行写 PNG 帧的线程数（0=串行）")
     args = parser.parse_args()
 
     # 检查输出目录
@@ -84,6 +95,8 @@ def main():
     state_dim = sample_data['qpos'].shape[1]    # 7
     action_dim = sample_data['action'].shape[1]  # 7
     img_h, img_w = sample_data['camera_global'].shape[1:3]
+    # 末端位姿可选: 仅当首帧 HDF5 含 ee_pose 时才声明并写入该 feature
+    has_ee_pose = 'ee_pose' in sample_data
 
     print(f"状态维度: {state_dim}, 动作维度: {action_dim}")
     print(f"图像尺寸: {img_h}x{img_w}")
@@ -116,6 +129,17 @@ def main():
         },
     }
 
+    # 末端位姿作为独立观测字段写入。
+    # 注: 必须是独立键 observation.ee_pose, 切勿拼进 observation.state (会改 state 维度、破坏现有训练)。
+    # ACT/SmolVLA/Pi0 均只读 observation.state, 此字段作为 STATE 类型存在但不被模型消费,
+    # 因此加入后不影响当前训练; 待后续需要时再改 modeling 才能真正喂给模型。
+    if has_ee_pose:
+        features["observation.ee_pose"] = {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": ["x", "y", "z", "rx", "ry", "rz"],
+        }
+
     # 创建 LeRobot 数据集
     print(f"\n创建数据集: {args.output_dir}")
     dataset = LeRobotDataset.create(
@@ -125,6 +149,11 @@ def main():
         root=args.output_dir,
         robot_type="realman",
         use_videos=True,
+        # AV1(libsvtav1) 编码 CPU 密集、比 h264 慢数倍; 训练用 h264 足够且不影响格式合法性
+        vcodec=args.vcodec,
+        # add_frame 默认串行写 PNG 到磁盘, 开多进程/线程并行缓解 I/O 阻塞
+        image_writer_processes=args.image_writer_processes,
+        image_writer_threads=args.image_writer_threads,
     )
 
     total_frames = 0
@@ -151,6 +180,9 @@ def main():
                     data['action'][frame_idx].astype(np.float32)),
                 "task": args.task,
             }
+            if has_ee_pose:
+                frame_data["observation.ee_pose"] = torch.from_numpy(
+                    data['ee_pose'][frame_idx].astype(np.float32))
             dataset.add_frame(frame_data)
 
         dataset.save_episode()

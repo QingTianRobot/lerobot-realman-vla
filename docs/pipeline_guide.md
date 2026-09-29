@@ -31,12 +31,15 @@ python scripts/collect_data.py \
 
 | 按键 | 功能 | 备注 |
 |------|------|------|
-| `v` | 校准 Vive 零点 | Tracker 必须静止 |
-| `w` / `e` | 启用/停止遥控 | |
-| `s` / `d` | 开始/停止录制 | |
-| `c` / `o` | 夹爪闭合/打开 | |
-| `g 50` | 夹爪开到 50% | 0=闭合，100=张开 |
+| `w` | 遥控 开/关（toggle） | 启用时**以当前 Tracker 位为零点、机械臂当前位姿为基点**，原地 engage 不突跳（仅 Vive 模式） |
+| `s` | 录制 开始/保存（toggle） | 单键切换开始 / 停止并保存（停止时**自动暂停遥操**） |
+| `h` | 复位 | 常速归位到 `ROBOT_INIT`；执行前自动暂停遥操；**录制中也可复位**（仅 Vive 模式） |
+| `1`/`2`/`3` | 夹爪预设开度 | 30%/60%/100%，可在 [`configs/keybindings.json`](../configs/keybindings.json) 自定义 |
+| `c` / `o` | 夹爪闭合 / 张开 | 0% / 100% |
+| `p` | 夹爪控制源 Pika主手/键盘 切换 | 默认 Pika 主手（互斥）；需按 `w` 开启遥操后夹爪才跟随，见 [数据采集指南 5.1](data_collection.md#51-pika-主手夹爪默认启用的首选夹爪控制源) |
 | `q` | 退出 | |
+
+> 单键即触发（无需回车）；按键表见 [`configs/keybindings.json`](../configs/keybindings.json)，terminal 与后续 web 前端共用。
 
 ### 数据量参考
 
@@ -74,7 +77,7 @@ with h5py.File('data/raw_hdf5/pick_cube_0.hdf5', 'r') as f:
 
 ```bash
 python scripts/convert_to_lerobot.py \
-    --input-dir data/raw_hdf5/pick_cube \
+    --input-dir data/raw_hdf5 \
     --output-dir data/pick_cube_30fps \
     --repo-id lerobot/pick_cube_30fps \
     --fps 30 \

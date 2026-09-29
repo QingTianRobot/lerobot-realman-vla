@@ -14,6 +14,7 @@
 
 采集数据格式：HDF5
   - observations/qpos: (N, 7)   [6关节角 + 夹爪(归一化 0~1, 1=张开)]
+  - observations/ee_pose: (N, 6)  [末端笛卡尔位姿 x,y,z,rx,ry,rz (米/弧度), 机械臂直接读取非解算]
   - observations/images/camera_global: (N, H, W, 3)
   - observations/images/camera_left: (N, H, W, 3)
   - action: (N, 7)              [下一帧的 qpos]
@@ -33,8 +34,11 @@ import termios
 import time
 import math
 import threading
+import queue
+import contextlib
 import sys
 import os
+import json
 import h5py
 import numpy as np
 import cv2
@@ -52,6 +56,28 @@ GRIPPER_PORT = "/dev/realman/gripper_left"
 GRIPPER_SLAVE_ID = 2          # 知行夹爪 Modbus 从站地址
 GRIPPER_BAUDRATE = 115200
 GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /100=mm); 若存在 hardware/gripper_calibration.json 则以标定值为准
+# 夹爪电机行程速度 (0~100, 占最大速度百分比): 直接决定开合快慢 —— 旧默认 50 手感偏"慢",
+# 提到 100(=官方 SDK temp_move 默认)让键盘/推理的张开-闭合更跟手; 夹持力由 force_pct 独立
+# 限制, 提速不增大夹持力。嫌太猛可下调 (采集与推理务必用同一值, 否则开合动态与训练数据不一致)。
+GRIPPER_SPEED_PCT = 100
+# 夹爪 RS-485 总线轮询频率(Hz): 决定异步命令(move_normalized→request_move)最长排队时延(1/hz)。
+# 本机 CH341/USB 总线有抖动史, 过高会加剧 CRC/丢帧, 故保守取 25; 命令排队(≤40ms)非主要延迟。
+GRIPPER_POLL_HZ = 25
+# 夹爪复位开度 (归一化 0~1, 1=张开): 机械臂归位到 ROBOT_INIT 后把夹爪也归到此状态,
+# 保证每条 episode 都从一致的「机械臂起始位 + 夹爪张开」开始 (抓取任务的自然起点)。
+GRIPPER_RESET_VALUE = 1.0
+GRIPPER_RESET_TOL = 0.05      # 复位等待到位的归一化容差: 反馈与目标偏差<此值即视为到位
+GRIPPER_RESET_TIMEOUT = 3.0   # 复位等待到位超时(秒): 超时仅告警, 不阻塞后续操作
+
+# Pika Sense 主手夹爪 (可选第二套夹爪控制源, 与键盘互斥; 需 --pika-gripper 启用)
+PIKA_GRIPPER_PORT = "/dev/tty_pika_left"   # 见 /etc/udev/rules.d/98-usb-serial.rules 的 PIKA_LEFT
+PIKA_TELEOP_HZ = 30          # 主手→从手映射下发频率(Hz); 从手 move_normalized 异步覆盖式下发, 总线按其 poll_hz 消费
+PIKA_TELEOP_DEADBAND = 0.02  # 归一化死区: 变化<此值不重复下发, 减少知行 RTU 总线写入
+# 从手逼近主手的归一化限速 (单位/秒): 全程 0→1 约 1/rate 秒。【仅作用于刚 engage 的追赶阶段】——
+# 把「engage 瞬间从手立即对齐主手当前开合」的突跳摊成平滑斜坡 (以从手当前实际位置为起点逐步逼近);
+# 一旦追上主手即转为直接 1:1 跟随, 不再限速 → 消除正常操作时的"黏滞/跟不上手"滞后。
+# ≤0 关闭限速 (engage 时也直接瞬间对齐)。
+PIKA_TELEOP_RAMP_RATE = 2.5
 
 # 机械臂初始位姿（Vive遥操作零点对应的机械臂笛卡尔位姿）
 # 含义: 按 v 校准零点后, tracker 在零点时机械臂应处的位姿; 按 w 启用后机械臂以此为基础跟随。
@@ -68,6 +94,39 @@ ROBOT_INIT_ORI = np.array([-3.102, 0.065, 1.609])
 #       Robot_X = -Vive_Z, Robot_Y = -Vive_X, Robot_Z = +Vive_Y。
 #   · 现场若方向不对, 改这三个角度即可, 不用再逐轴翻符号/换下标。
 VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw(Z)] 单位度
+
+# 机械臂归位 (rm_movej_p: 关节空间规划到 ROBOT_INIT 笛卡尔位姿, 大位移最稳、不撞奇异点)
+ARM_HOME_SPEED_SLOW = 5      # 启动慢速归位速度百分比 v(1~100): 上电位姿未知, 求稳(用户指定 5%)
+ARM_HOME_SPEED_NORMAL = 45   # 复位键常速归位速度百分比
+ARM_HOME_COUNTDOWN = 3       # 启动归位前倒计时秒数, 留时间清空机械臂周围
+ARM_HOME_POS_TOL = 0.02      # 慢速归位"已在起始位附近"的位置容差(米): 与 ROBOT_INIT 偏差<2cm
+ARM_HOME_ORI_TOL = float(np.radians(5.0))   # 同上姿态容差(弧度): 偏差<5° 则跳过慢速归位
+# ⚠️ rm_set_arm_run_mode 是"仿真(0)/真实(1)"开关, 不是运动模式! 全程保持真实(1):
+#    规划运动(rm_movej_p)与 CANFD 透传(rm_movep_canfd)都在真实模式下执行, 归位无需切模式
+#    (切到 0=仿真会让指令只在仿真里跑、真实机械臂不动 —— 这正是"归位没反应"的坑)。
+VIVE_CALIB_FRAMES = 5        # 启用遥操时自动校准零点的平均帧数 (原 30 帧太长, 现取当前手持位)
+# 遥操透传频率(Hz): rm_movep_canfd 是透传指令, 为高频稳定流设计。频率越高跟随越紧、延迟越低。
+# 睿尔曼官方低跟随示例 RMDemo_MovejCANFD 用 100Hz; 原实现写死 20Hz(interval=0.05)是遥操延迟主因。
+# 50~100 之间按机器负载调; 若配合录制抢锁明显, 可先取 50。
+VIVE_CONTROL_HZ = 100        # 默认配合高跟随(需≥100Hz); 用 --no-high-follow 低跟随且嫌抢锁时可显式 --control-hz 50
+# 高跟随模式(follow=True): 滞后最小, 但透传周期要求 ≤10ms(即 ≥100Hz)。开启后若 control_hz<100 会自动抬到 100。
+#   默认开(本项目实机调定); --no-high-follow 可关(改回低跟随, 控制器自规划更软、无 ≤10ms 约束)。
+VIVE_FOLLOW_HIGH = True
+# SDK 控制器侧轨迹平滑(仅高跟随生效): 治理"伺服刚性嗡颤"——完全透传下伺服刚性追每个设定点激起的机械高频振,
+# 发生在我们指令的下游, 软件滤波(One Euro)够不着, 只能靠控制器在伺服前重新拟合/滤波轨迹来抑制。
+#   trajectory_mode: 0=完全透传(无 SDK 平滑), 1=曲线拟合, 2=滤波(默认)。
+#   radio: 拟合(0~100)/滤波(0~1000)平滑系数, 越大越平滑、滞后越明显; mode=0 时无效。
+# 与手抖分工: 手部生理抖/tracker 噪声(输入端)→ 下面 One Euro; 伺服嗡颤(控制器端)→ 本项。
+VIVE_TRAJ_MODE = 2           # 默认滤波模式(实机调定: 高跟随下压伺服嗡颤)
+VIVE_TRAJ_RADIO = 600        # 默认滤波系数(越大越平滑、滞后越大; 实机 600 手感可接受)
+# One Euro 自适应滤波 (替代固定截止低通): 慢速/静止时用低截止→强平滑压手抖, 快速运动时自动升截止→几乎无滞后。
+# 化解"平滑 vs 延迟"两难: 可保留高跟随@100Hz 的跟手, 同时压掉高频细碎颤 (固定低通做不到)。
+#   MINCUTOFF(Hz): 零速截止频率。越低越压静止手抖(慢速运动滞后略增); 静止仍颤→降到 0.5/0.1。
+#   BETA: 速度系数(截止随速度上升的斜率)。经验 10~30 越跟手; 默认取 1.0(刻意压快速段跟随、增阻尼防"太快"), 嫌拖可调大。
+#   DCUTOFF(Hz): 对"速度"再做低通的截止, 一般 1.0 即可。
+VIVE_OE_MINCUTOFF = 0.1      # 默认强平滑压静止手抖(实机调定)
+VIVE_OE_BETA = 1.0           # 默认低速度系数: 快速段也重平滑, 抑制"跟随太快"(代价: 滞后略增)
+VIVE_OE_DCUTOFF = 1.0
 # ============ 配置区域结束 ============
 
 
@@ -77,6 +136,9 @@ VIVE_TO_ROBOT_RPY_DEG = np.array([90.0, 0.0, -90.0])   # [roll(X), pitch(Y), yaw
 _HARDWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hardware')
 if _HARDWARE_DIR not in sys.path:
     sys.path.insert(0, _HARDWARE_DIR)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_KEYBINDINGS_PATH = os.path.join(_REPO_ROOT, "configs", "keybindings.json")
 
 from orbbec_camera import OrbbecCamera              # 腕部相机 (奥比中光)
 from realsense_camera import RealSenseCamera        # 顶部相机 (Intel RealSense D435)
@@ -170,6 +232,72 @@ def _scale_rotation(R, s):
     return _quat_to_matrix(q2)
 
 
+def _pose_deviation(cur_pose, target_pose):
+    """两个 6D 位姿 [x,y,z,rx,ry,rz](米/弧度) 的偏差 → (位置偏差 米, 姿态偏差 弧度)。
+
+    姿态用旋转矩阵测地角 arccos((tr(R_curᵀ·R_tgt)-1)/2), 避免欧拉角 wrap / ±π 歧义
+    (直接比 rx/ry/rz 会把 -3.1 与 +3.1 当成差 6.2, 实则同一朝向)。
+    """
+    dp = float(np.linalg.norm(np.asarray(cur_pose[:3]) - np.asarray(target_pose[:3])))
+    R_rel = _euler_xyz_to_matrix(np.asarray(cur_pose[3:6])).T @ _euler_xyz_to_matrix(np.asarray(target_pose[3:6]))
+    cos_t = float(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0))
+    return dp, float(np.arccos(cos_t))
+
+
+class OneEuroFilter:
+    """One Euro 自适应低通滤波器 (Casiez et al. 2012), 支持多维 numpy 向量。
+
+    固定截止的低通在"平滑"与"延迟"之间此消彼长; One Euro 用"信号速度"自适应调截止:
+    慢速(手抖主导)→低截止→强平滑; 快速(有意运动)→高截止→几乎无滞后。适合遥操/VR 手部去噪。
+
+    参数:
+      freq      采样频率(Hz), 取控制循环频率。
+      mincutoff 零速截止频率(Hz): 越低越压静止手抖, 慢速运动滞后略增。
+      beta      速度系数: 截止随速度上升的斜率。越大快速越跟手, 但快速时可能漏过抖动。
+      dcutoff   对速度做低通的截止频率(Hz), 一般 1.0。
+    """
+
+    def __init__(self, freq, mincutoff=1.0, beta=0.0, dcutoff=1.0):
+        self.freq = max(1e-6, float(freq))
+        self.mincutoff = float(mincutoff)
+        self.beta = float(beta)
+        self.dcutoff = float(dcutoff)
+        self._x_prev = None
+        self._dx_prev = None
+
+    @property
+    def prev(self):
+        """上一次滤波输出 (供姿态四元数统一半球判断); 未初始化时为 None。"""
+        return self._x_prev
+
+    def _alpha(self, cutoff):
+        te = 1.0 / self.freq
+        tau = 1.0 / (2.0 * math.pi * max(1e-6, cutoff))
+        return 1.0 / (1.0 + tau / te)
+
+    def reset(self):
+        """清空历史; 重新 engage 时调用, 让滤波从新起点起步、不用旧值突跳。"""
+        self._x_prev = None
+        self._dx_prev = None
+
+    def __call__(self, x):
+        x = np.asarray(x, dtype=float)
+        if self._x_prev is None:
+            self._x_prev = x.copy()
+            self._dx_prev = np.zeros_like(x)
+            return x.copy()
+        dx = (x - self._x_prev) * self.freq            # 瞬时速度 (单位/秒)
+        ad = self._alpha(self.dcutoff)
+        dx_hat = ad * dx + (1.0 - ad) * self._dx_prev  # 低通后的速度估计
+        speed = float(np.linalg.norm(dx_hat))          # 多维共用一个标量速度
+        cutoff = self.mincutoff + self.beta * speed    # 速度越快截止越高
+        a = self._alpha(cutoff)
+        x_hat = a * x + (1.0 - a) * self._x_prev
+        self._x_prev = x_hat
+        self._dx_prev = dx_hat
+        return x_hat
+
+
 # ============ Vive 遥控模块 ============
 class ViveController:
     """Vive Tracker 遥操作控制器
@@ -183,12 +311,28 @@ class ViveController:
     避免欧拉角逐轴相减在大角度/万向锁处失效。
     """
 
-    def __init__(self, arm, arm_lock, tracker_serial=None, enable_vive=True):
+    def __init__(self, arm, arm_lock, tracker_serial=None, enable_vive=True,
+                 control_hz=VIVE_CONTROL_HZ, follow_high=VIVE_FOLLOW_HIGH,
+                 traj_mode=VIVE_TRAJ_MODE, traj_radio=VIVE_TRAJ_RADIO,
+                 oe_mincutoff=VIVE_OE_MINCUTOFF, oe_beta=VIVE_OE_BETA,
+                 oe_dcutoff=VIVE_OE_DCUTOFF):
         self.arm = arm
         self.arm_lock = arm_lock
         self.tracker_serial = tracker_serial or DEFAULT_TRACKER_SERIAL
         self.enable_vive = enable_vive
+        self.follow_high = bool(follow_high)
+        self.traj_mode = int(traj_mode)      # 控制器侧轨迹平滑(治伺服嗡颤), 仅高跟随生效
+        self.traj_radio = int(traj_radio)
+        # 高跟随要求透传周期 ≤10ms(≥100Hz); 频率不足则自动抬到 100, 否则控制器可能拒收/抖动
+        self.control_hz = max(1.0, float(control_hz))
+        if self.follow_high and self.control_hz < 100.0:
+            print(f"[i] 高跟随模式要求 ≥100Hz, control_hz 自动 {self.control_hz:.0f}→100")
+            self.control_hz = 100.0
+        # One Euro 自适应滤波: 位置/姿态各一个, 采样频率=控制频率。慢速去颤、快速跟手。
+        self._pos_filt = OneEuroFilter(self.control_hz, oe_mincutoff, oe_beta, oe_dcutoff)
+        self._quat_filt = OneEuroFilter(self.control_hz, oe_mincutoff, oe_beta, oe_dcutoff)
 
+        # 遥操基点(位置/姿态): 初值用全局 ROBOT_INIT 兜底, 每次 enable() 会改绑到机械臂"当前"位姿
         self.robot_init_pos = ROBOT_INIT_POS.copy()
         self.robot_init_ori = ROBOT_INIT_ORI.copy()
         # 起始姿态的旋转矩阵形式 (固定轴 XYZ/RPY: R = Rz·Ry·Rx)
@@ -270,16 +414,20 @@ class ViveController:
                 first = device
         return first
 
-    def calibrate(self):
-        """校准：记录当前 Vive Tracker 位姿作为零点"""
+    def calibrate(self, frames=None):
+        """以当前 Vive Tracker 位姿为零点。frames=平均帧数(默认 VIVE_CALIB_FRAMES)。
+
+        启用遥操(enable)时自动调用: 每次都以"当前手持位置"为零点, 无需单独手动校准、
+        也不必记住某个全局固定零点。少量帧平均仅用于抑制单帧抖动/丢帧。
+        """
         if self.tracker is None:
             print("[!] Vive 未连接")
             return False
 
-        print("校准中... 保持 Tracker 静止")
+        frames = VIVE_CALIB_FRAMES if frames is None else max(1, int(frames))
         positions = []
         quats = []          # [w,x,y,z]
-        for _ in range(30):
+        for _ in range(frames):
             pose = self.tracker.get_pose_quaternion()   # [x,y,z, w,qx,qy,qz]
             if pose:
                 positions.append([pose[0], pose[1], pose[2]])
@@ -287,37 +435,76 @@ class ViveController:
                 if quats and np.dot(q, quats[0]) < 0:
                     q = -q  # 统一到同一半球, 避免四元数符号翻转导致平均抵消
                 quats.append(q)
-            time.sleep(0.033)
+            time.sleep(0.02)
 
         if not quats:
-            print("[!] 校准失败")
+            print("[!] 校准失败: 读不到 Tracker 位姿")
             return False
 
         self.vive_init_pos = np.mean(positions, axis=0)
         q_mean = np.mean(quats, axis=0)
         self.vive_init_R = _quat_to_matrix(q_mean / np.linalg.norm(q_mean))
-        print("校准完成")
         return True
 
+    def _read_arm_pose(self):
+        """读机械臂当前笛卡尔位姿 [x,y,z, rx,ry,rz] (米/弧度); 失败返回 None。"""
+        try:
+            with self.arm_lock:
+                code, state = self.arm.rm_get_current_arm_state()
+            if code == 0 and state and state.get("pose"):
+                return [float(x) for x in state["pose"][:6]]
+        except Exception as e:  # noqa: BLE001 - 读状态失败不应中断
+            print(f"[!] 读机械臂当前位姿失败: {e}")
+        return None
+
     def enable(self):
-        if self.vive_init_pos is None:
-            print("请先校准(v)")
+        """启用遥操: 同时捕获「Tracker 当前位姿=零点」与「机械臂当前位姿=基点」。
+
+        基点绑定机械臂"当前"位置(而非全局 ROBOT_INIT), 故按下 w 时机械臂原地 engage、
+        不会突跳到 ROBOT_INIT; 手的相对运动从当前位置开始映射。
+        """
+        if self.tracker is None:
+            print("[!] Vive 未连接, 无法启用遥操")
             return
+        if not self.calibrate():       # Tracker 零点 = 当前手持位置
+            return
+        arm_pose = self._read_arm_pose()   # 机械臂基点 = 当前位姿 (不绑定 ROBOT_INIT)
+        if arm_pose is None:
+            print("[!] 读不到机械臂当前位姿, 无法启用遥操")
+            return
+        self.robot_init_pos = np.array(arm_pose[:3])
+        self.robot_init_ori = np.array(arm_pose[3:6])
+        self.robot_init_R = _euler_xyz_to_matrix(self.robot_init_ori)
+        self._pos_filt.reset()     # 重置滤波, 从本次 engage 位姿起步, 避免用旧滤波值突跳
+        self._quat_filt.reset()
         self.control_enabled = True
-        print("遥控已启用")
+        print("遥控已启用 (Tracker 零点=当前手持位, 机械臂基点=当前位姿)")
 
     def disable(self):
         self.control_enabled = False
         print("遥控已暂停")
 
     def _control_loop(self):
-        """20Hz 遥控循环"""
-        interval = 0.05
+        """高频遥控循环 (deadline 节拍, 频率 self.control_hz, 默认 VIVE_CONTROL_HZ)。
+
+        用绝对 deadline 计时而非循环开头固定 sleep, 避免周期漂移累积成"阻塞感";
+        单步超时(读位姿/透传偶发变慢)则重置 deadline 丢弃积压, 防止随后指令突发。
+        """
+        interval = 1.0 / self.control_hz
         last_ret = 0      # 上一次 movep 返回码 (节流打印用)
         last_err = None   # 上一次异常信息 (节流打印用)
+        next_time = time.time()
 
         while self.running:
-            time.sleep(interval)
+            now = time.time()
+            if now < next_time:
+                time.sleep(min(0.002, next_time - now))
+                continue
+            # 落后超过一个周期: 重置节拍, 不补发积压指令 (避免机械臂追旧目标点抖动)
+            if now - next_time > interval:
+                next_time = now
+            next_time += interval
+
             if (not self.control_enabled or self.tracker is None
                     or self.vive_init_pos is None or self.vive_init_R is None):
                 continue
@@ -347,21 +534,35 @@ class ViveController:
                 R_delta = R_cur @ self.vive_init_R.T
                 R_delta = M @ R_delta @ M.T
                 R_delta = _scale_rotation(R_delta, scale_ori)   # 按 scale_ori 缩放转角
-                target_ori = _matrix_to_euler_xyz(R_delta @ self.robot_init_R)
+                R_target = R_delta @ self.robot_init_R
+                target_quat = _matrix_to_quat(R_target)          # [w,x,y,z]
+
+                # ---- One Euro 自适应滤波: 慢速去颤(强平滑)、快速跟手(几乎无滞后) ----
+                # 化解"平滑 vs 延迟"两难: 静止/慢速压掉高频细碎颤, 有意快速运动不加滞后。
+                # 姿态四元数滤波前先与上次输出统一半球, 避免符号翻转导致插值抵消。
+                q_prev = self._quat_filt.prev
+                if q_prev is not None and float(np.dot(q_prev, target_quat)) < 0:
+                    target_quat = -target_quat
+                filt_pos = self._pos_filt(target_pos)
+                filt_quat = self._quat_filt(target_quat)
+                filt_quat = filt_quat / np.linalg.norm(filt_quat)
 
                 # 安全限位（笛卡尔工作空间, 单位米）: 防止手滑把机械臂推出安全区。
                 # 换成你的实际可达范围; 若机械臂总在某方向到不了边界, 放宽对应上下限。
-                target_pos[0] = np.clip(target_pos[0], -0.5, 0.5)
-                target_pos[1] = np.clip(target_pos[1], -0.5, 0.5)
-                target_pos[2] = np.clip(target_pos[2], -0.15, 0.3)
+                filt_pos[0] = np.clip(filt_pos[0], -0.5, 0.5)
+                filt_pos[1] = np.clip(filt_pos[1], -0.5, 0.5)
+                filt_pos[2] = np.clip(filt_pos[2], -0.15, 0.3)
 
+                target_ori = _matrix_to_euler_xyz(_quat_to_matrix(filt_quat))
                 target_6d = [
-                    float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
+                    float(filt_pos[0]), float(filt_pos[1]), float(filt_pos[2]),
                     float(target_ori[0]), float(target_ori[1]), float(target_ori[2])
                 ]
 
                 with self.arm_lock:
-                    ret = self.arm.rm_movep_canfd(target_6d, False, 0, 60)
+                    # trajectory_mode/radio: 控制器侧轨迹平滑(治伺服刚性嗡颤); 手抖由 One Euro 处理
+                    ret = self.arm.rm_movep_canfd(target_6d, self.follow_high,
+                                                  self.traj_mode, self.traj_radio)
 
                 # 诊断: 返回码非 0 = 逆解失败/姿态不可达, 机械臂会停在上一位姿 (节流打印)
                 if ret != 0 and ret != last_ret:
@@ -383,12 +584,99 @@ class ViveController:
             self.vive = None
 
 
+# ============ Pika 主手夹爪遥操模块 ============
+class PikaGripperTeleop:
+    """Pika Sense 主手夹爪 → 机械臂从手夹爪 的遥操线程 (与键盘夹爪控制互斥)。
+
+    只接管夹爪, 不碰机械臂位姿, 无需 arm_lock。仅当【被选为当前控制源(enabled)】
+    且【机械臂遥操已开启(teleop_gate 为真)】时, 才按 hz 读主手归一化行程写到从手夹爪
+    (move_normalized 异步覆盖式下发, 由知行总线线程按 poll_hz 消费); 变化小于 deadband
+    不重复下发, 减少 RTU 总线写入。即: 按 w 开启遥操→夹爪跟随主手, 暂停遥操→夹爪停写。
+
+    限速斜坡(ramp_rate): 【仅用于刚 engage 的追赶阶段】—— 此时从手与主手开度往往不一致,
+    若直接对齐会造成夹爪瞬间突跳(可能夹手/撞到物体、并在录制里留下一段快变)。故 engage 时
+    以从手当前实际位置为起点, 每步最多变化 ramp_rate/hz 逐步逼近主手, 把突跳摊成平滑斜坡;
+    一旦追上主手即转入【直接 1:1 跟随】(不再限速), 消除正常操作时的跟随滞后。
+
+    teleop_gate: 无参可调用返回 bool, 判断机械臂遥操是否开启; None 表示不门控(如示教模式)。
+    """
+
+    def __init__(self, master, gripper, hz=PIKA_TELEOP_HZ, deadband=PIKA_TELEOP_DEADBAND,
+                 ramp_rate=PIKA_TELEOP_RAMP_RATE, teleop_gate=None):
+        self.master = master
+        self.gripper = gripper
+        self.hz = max(1.0, float(hz))
+        self.deadband = max(0.0, float(deadband))
+        # 归一化行程限速(单位/秒): 限制从手每步逼近主手的最大变化, ≤0 关闭限速。
+        self.ramp_rate = float(ramp_rate)
+        self.teleop_gate = teleop_gate
+        self.enabled = False       # 仅在被设为当前夹爪控制源时写从手
+        self.running = True
+        self._cmd_v = None         # 限速斜坡的当前指令值(归一化); None=尚未 engage
+        self._catching_up = False  # True=engage 后正限速追赶主手; 追上后置 False 转直接跟随
+        self._last_sent = None     # 上一次真正下发到总线的值 (死区判断用)
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        interval = 1.0 / self.hz
+        # engage 追赶阶段每步最大变化量: 全程 0→1 需 1/ramp_rate 秒; ramp_rate≤0 时不限速。
+        # 仅用于「刚 engage 追赶主手」, 追上后转直接 1:1 跟随(见 _catching_up), 不再限速。
+        max_step = self.ramp_rate * interval if self.ramp_rate > 0 else None
+        last_err = None
+        while self.running:
+            time.sleep(interval)
+            # 双重门控: 被选为控制源 且 (无门控 或 机械臂遥操已开启) 才写从手
+            gate_open = self.teleop_gate is None or bool(self.teleop_gate())
+            if not self.enabled or not gate_open:
+                # 未接管/遥操暂停: 清斜坡状态; 下次 engage 从从手「当前实际位置」起步平滑对齐, 不突跳
+                self._cmd_v = None
+                self._catching_up = False
+                self._last_sent = None
+                continue
+            try:
+                target = self.master.get_normalized()
+                if target is None:
+                    continue
+                if self._cmd_v is None:
+                    # 刚 engage: 以从手当前反馈位置为斜坡起点 (而非直接跳到主手值), 消除瞬间突跳
+                    self._cmd_v = self.gripper.get_position_normalized()
+                    self._catching_up = True
+                if self._catching_up and max_step is not None:
+                    # 追赶阶段: 限速逐步逼近主手, 把 engage 突跳摊成平滑斜坡 (防夹手/撞物)
+                    delta = target - self._cmd_v
+                    if abs(delta) <= max_step:
+                        self._cmd_v = target
+                        self._catching_up = False   # 已追上主手 → 转入直接跟随, 此后不再限速
+                    else:
+                        self._cmd_v += math.copysign(max_step, delta)
+                else:
+                    # 已追上(或未启用限速): 直接 1:1 跟随主手, 不做人为限速 → 消除跟随滞后
+                    self._cmd_v = target
+                # 死区: 与上次下发值变化过小则不重复写 RTU 总线
+                if self._last_sent is not None and abs(self._cmd_v - self._last_sent) < self.deadband:
+                    continue
+                self.gripper.move_normalized(self._cmd_v)
+                self._last_sent = self._cmd_v
+            except Exception as e:  # noqa: BLE001 - 遥操线程不能因单次异常中断
+                if str(e) != last_err:
+                    print(f"[!] Pika 夹爪遥操异常: {e}")
+                    last_err = str(e)
+
+    def shutdown(self):
+        self.running = False
+        self.enabled = False
+        if getattr(self, "thread", None) is not None:
+            self.thread.join(timeout=1.0)
+
+
 # ============ 数据录制模块 ============
 class DataRecorder:
     """以固定频率录制机械臂状态、相机图像到 HDF5
 
     数据格式:
       observations/qpos:             (N, 7) float32  [6关节角 + 夹爪位置]
+      observations/ee_pose:          (N, 6) float32  [末端笛卡尔位姿 x,y,z,rx,ry,rz (米/弧度), 机械臂直接返回, 非解算]
       observations/images/camera_global:  (N, H, W, 3) uint8
       observations/images/camera_left: (N, H, W, 3) uint8
       action:                        (N, 7) float32  [下一帧的qpos，即行为克隆标签]
@@ -404,25 +692,28 @@ class DataRecorder:
         self.is_recording = False
         self.filename = None
         self.target_fps = target_fps
-        self.data_buffer = {'qpos': [], 'images_top': [], 'images_wrist': [], 'timestamps': []}
+        self.data_buffer = {'qpos': [], 'ee_pose': [], 'images_top': [],
+                            'images_wrist': [], 'timestamps': []}
 
     def start(self, filename):
         if self.is_recording:
             return
         self.filename = filename
         self.is_recording = True
-        self.data_buffer = {'qpos': [], 'images_top': [], 'images_wrist': [], 'timestamps': []}
+        self.data_buffer = {'qpos': [], 'ee_pose': [], 'images_top': [],
+                            'images_wrist': [], 'timestamps': []}
         self.record_start_time = time.time()
         self.thread = threading.Thread(target=self._record_loop, daemon=True)
         self.thread.start()
         print(f"录制开始: {os.path.basename(filename)} (目标 {self.target_fps}Hz)")
 
     def stop(self):
+        """停止录制并落盘; 返回保存成功的 HDF5 路径 (无数据/保存失败返回 None)。"""
         if not self.is_recording:
-            return
+            return None
         self.is_recording = False
         self.thread.join()
-        self._save()
+        return self._save()
 
     def _record_loop(self):
         interval = 1.0 / self.target_fps
@@ -442,6 +733,10 @@ class DataRecorder:
                     code, state = self.arm.rm_get_current_arm_state()
 
                 joint_angles = state['joint'] if code == 0 else [0] * 6
+                # 末端位姿与关节角来自同一次 rm_get_current_arm_state() 调用:
+                # state['pose'] = [x,y,z,rx,ry,rz] (米/弧度), 机械臂控制器直接返回, 非正/逆解算。
+                # 读失败时用 6 个 0 兜底, 与 qpos 保持帧数对齐。
+                ee_pose = [float(x) for x in state['pose'][:6]] if code == 0 else [0.0] * 6
                 # 夹爪走独立串口，后台轮询线程已缓存反馈，无需 arm_lock
                 gripper_val = self.gripper.get_position_normalized()
 
@@ -449,6 +744,7 @@ class DataRecorder:
                 img_wrist = self.cam_wrist.get_frame()
 
                 self.data_buffer['qpos'].append(joint_angles + [gripper_val])
+                self.data_buffer['ee_pose'].append(ee_pose)
                 self.data_buffer['images_top'].append(img_top)
                 self.data_buffer['images_wrist'].append(img_wrist)
                 self.data_buffer['timestamps'].append(timestamp)
@@ -458,7 +754,7 @@ class DataRecorder:
     def _save(self):
         if not self.data_buffer['qpos']:
             print(" >> 无数据")
-            return
+            return None
 
         qpos = self.data_buffer['qpos']
         # 行为克隆标签: action[t] = qpos[t+1]
@@ -475,17 +771,531 @@ class DataRecorder:
                 f.attrs['sim'] = False
                 f.attrs['fps'] = self.target_fps
                 f.create_dataset('observations/qpos', data=np.array(qpos))
+                f.create_dataset('observations/ee_pose', data=np.array(self.data_buffer['ee_pose']))
                 f.create_dataset('action', data=np.array(actions))
                 f.create_dataset('timestamps', data=np.array(timestamps))
+                # gzip 对照片压缩率低且单线程极慢; lzf 快约 5~10x, 中间文件转完即删无需高压缩比
+                # (h5py 读取时透明解压, convert_to_lerobot.py 无需改动)
                 f.create_dataset('observations/images/camera_global',
                                  data=np.array(self.data_buffer['images_top']),
-                                 compression="gzip")
+                                 compression="lzf", chunks=True)
                 f.create_dataset('observations/images/camera_left',
                                  data=np.array(self.data_buffer['images_wrist']),
-                                 compression="gzip")
+                                 compression="lzf", chunks=True)
             print(f"保存: {os.path.basename(self.filename)} ({len(qpos)} frames)")
+            return self.filename
         except Exception as e:
             print(f"[!] 保存失败: {e}")
+            return None
+
+
+# ============ 异步 LeRobot 转换模块 ============
+@contextlib.contextmanager
+def _suppress_native_stderr():
+    """视频编码期间把进程级 stderr(fd 2) 重定向到 devnull, 压掉 libx264/ffmpeg 的
+    INFO 统计噪声(形如 "[libx264 @ 0x..] i4 v,h,dc...")。
+
+    为何用 fd 级 dup2 而非 logging/av.logging 设级:
+      · 这些噪声由原生 libx264 直接写 fd 2, 绕过 Python logging;
+      · LeRobot encode_video_frames 结尾会 restore_default_callback() 把 av.logging 设置冲掉,
+        且双相机时编码在 fork 出的子进程里跑 —— 子进程继承父进程 fd 2,
+        故在父进程 dup2 才能连同子进程的噪声一并静音。退出时恢复原 stderr。
+    """
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    try:
+        with open(os.devnull, 'w') as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+
+
+class LeRobotAsyncConverter:
+    """后台单工作线程: 把采集保存的 HDF5 逐条异步转成 LeRobot 数据集。
+
+    语义: 数据集不存在→LeRobotDataset.create 新建; 已存在(有 meta/info.json)→载入后
+    追加一条 episode (LeRobot 0.4.x 的 _save_episode_data 原生支持 resume: 重新载入时
+    latest_episode is None 会从 meta.episodes[-1] 算出下一个 chunk/file 索引, 不覆盖)。
+    每条: add_frame → save_episode → finalize; 完成后按约定删除原始 HDF5。
+
+    为何单线程串行: LeRobotDataset 非线程安全(add_frame/save_episode 不能并发),
+    且多条 episode 并发追加会争抢 episode_index; 故用一个 FIFO 队列 + 单工作线程。
+    视频编码在 Linux 下 save_episode 内部已用 ProcessPoolExecutor 并行(2 相机),
+    且 h264 编码释 GIL, 因此采集主循环只做入队, 不被转换阻塞。
+
+    颜色: HDF5 存的是相机 get_frame() 的 BGR, 而 LeRobot 走 PIL(按 RGB 解释),
+    直接传会红蓝互换; 故每帧 cv2.cvtColor(BGR2RGB), 与 convert_to_lerobot.py / inference.py 一致。
+    """
+
+    def __init__(self, lerobot_dir, repo_id, fps, task, vcodec="h264",
+                 image_writer_processes=4, image_writer_threads=4, delete_hdf5=True):
+        # 惰性导入: 仅在启用自动转换时引入 torch/lerobot, 不拖慢常规采集启动
+        import torch
+        from PIL import Image
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        self._torch = torch
+        self._Image = Image
+        self._LeRobotDataset = LeRobotDataset
+
+        self.root = str(lerobot_dir)
+        self.repo_id = repo_id
+        self.fps = int(fps)
+        self.task = task
+        self.vcodec = vcodec
+        self.image_writer_processes = image_writer_processes
+        self.image_writer_threads = image_writer_threads
+        self.delete_hdf5 = delete_hdf5
+
+        self._queue = queue.Queue()
+        self.converted = 0
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def enqueue(self, hdf5_path):
+        """入队一条已保存的 HDF5, 交由后台线程转换 (不阻塞调用方)。"""
+        self._queue.put(hdf5_path)
+        print(f"[转换] 已入队后台转换: {os.path.basename(hdf5_path)} → {self.root}")
+
+    def _loop(self):
+        while True:
+            item = self._queue.get()          # 阻塞等待; shutdown 会 put(None) 解阻
+            if item is None:
+                break
+            ok = False
+            try:
+                self._convert_one(item)
+                self.converted += 1
+                ok = True
+            except Exception as e:  # noqa: BLE001 - 单条转换失败不应中断整个队列
+                print(f"[!] 转换失败 {os.path.basename(item)}: {e}")
+            finally:
+                # 按约定总是删除 HDF5 (中间载体, 转完即删); 失败时仍删, 上方已告警
+                if self.delete_hdf5:
+                    try:
+                        os.remove(item)
+                        print(f"[转换] 已删除 HDF5: {os.path.basename(item)}"
+                              + ("" if ok else " (⚠ 转换未成功仍按约定删除)"))
+                    except OSError:
+                        pass
+
+    def _read_hdf5(self, path):
+        with h5py.File(path, 'r') as f:
+            data = {
+                'qpos': np.array(f['observations/qpos']),                              # (N,7)
+                'action': np.array(f['action']),                                       # (N,7)
+                'camera_global': np.array(f['observations/images/camera_global']),      # (N,H,W,3) BGR
+                'camera_left': np.array(f['observations/images/camera_left']),          # (N,H,W,3) BGR
+            }
+            # 末端位姿可选: 旧 HDF5 没有则跳过, 向后兼容
+            if 'observations/ee_pose' in f:
+                data['ee_pose'] = np.array(f['observations/ee_pose'])                  # (N,6)
+        return data
+
+    def _build_features(self, data):
+        state_dim = data['qpos'].shape[1]
+        action_dim = data['action'].shape[1]
+        img_h, img_w = data['camera_global'].shape[1:3]
+        joint_names = ["joint_1", "joint_2", "joint_3", "joint_4",
+                       "joint_5", "joint_6", "gripper"]
+        features = {
+            "observation.state": {"dtype": "float32", "shape": (state_dim,), "names": joint_names},
+            "observation.images.camera_global": {
+                "dtype": "video", "shape": (img_h, img_w, 3),
+                "names": ["height", "width", "channels"]},
+            "observation.images.camera_left": {
+                "dtype": "video", "shape": (img_h, img_w, 3),
+                "names": ["height", "width", "channels"]},
+            "action": {"dtype": "float32", "shape": (action_dim,), "names": joint_names},
+        }
+        # ee_pose 作为独立观测字段(切勿拼进 state, 会改维度破坏训练); 仅当 HDF5 含时才声明
+        if 'ee_pose' in data:
+            features["observation.ee_pose"] = {
+                "dtype": "float32", "shape": (6,), "names": ["x", "y", "z", "rx", "ry", "rz"]}
+        return features
+
+    def _open_dataset(self, data):
+        """数据集不存在则 create, 存在则载入以便 resume 追加。"""
+        info_json = os.path.join(self.root, "meta", "info.json")
+        if os.path.exists(info_json):
+            return self._LeRobotDataset(repo_id=self.repo_id, root=self.root, vcodec=self.vcodec)
+        return self._LeRobotDataset.create(
+            repo_id=self.repo_id, fps=self.fps, features=self._build_features(data),
+            root=self.root, robot_type="realman", use_videos=True,
+            vcodec=self.vcodec,   # AV1(libsvtav1) CPU 密集且慢数倍, 训练用 h264 足够
+            image_writer_processes=self.image_writer_processes,
+            image_writer_threads=self.image_writer_threads,
+        )
+
+    def _convert_one(self, hdf5_path):
+        data = self._read_hdf5(hdf5_path)
+        n = len(data['qpos'])
+        if n == 0:
+            print(f"[!] {os.path.basename(hdf5_path)} 无帧, 跳过")
+            return
+        has_ee = 'ee_pose' in data
+        ds = self._open_dataset(data)
+        torch, Image = self._torch, self._Image
+        for i in range(n):
+            frame = {
+                "observation.state": torch.from_numpy(data['qpos'][i].astype(np.float32)),
+                "observation.images.camera_global": Image.fromarray(
+                    cv2.cvtColor(data['camera_global'][i], cv2.COLOR_BGR2RGB)),
+                "observation.images.camera_left": Image.fromarray(
+                    cv2.cvtColor(data['camera_left'][i], cv2.COLOR_BGR2RGB)),
+                "action": torch.from_numpy(data['action'][i].astype(np.float32)),
+                "task": self.task,
+            }
+            if has_ee:
+                frame["observation.ee_pose"] = torch.from_numpy(
+                    data['ee_pose'][i].astype(np.float32))
+            ds.add_frame(frame)
+        # 编码期间静音原生 stderr, 压掉 libx264/ffmpeg 的 INFO 统计噪声(见 _suppress_native_stderr)
+        with _suppress_native_stderr():
+            ds.save_episode()
+        # 0.4.x 必须 finalize() 写 parquet footer, 否则数据集无效、无法载入 (非 0.3.x 的 consolidate)
+        ds.finalize()
+        print(f"[转换] {os.path.basename(hdf5_path)} → episode 完成 ({n} 帧); "
+              f"数据集累计 {ds.num_episodes} 条 / {ds.meta.total_frames} 帧")
+
+    def shutdown(self):
+        """排空队列: 发送哨兵并等工作线程把剩余 episode 全部转完再退出。"""
+        pending = self._queue.qsize()
+        if pending:
+            print(f"[转换] 退出前等待后台队列排空 ({pending} 条待转)...")
+        self._queue.put(None)
+        self.thread.join()
+        print(f"[转换] 已全部完成, 本次累计转换 {self.converted} 条 → {self.root}")
+
+
+# ============ 按键表 (terminal / web 前端共用) ============
+# 内置兜底按键表: configs/keybindings.json 缺失或损坏时使用, 保证脚本仍可运行。
+# 字段: key=单键; action=动作名(对应 CollectorController.action_<name>);
+#       args=动作参数(可选); label=界面显示; modes=可选["vive"|"teaching"](缺省=通用)。
+FALLBACK_BINDINGS = [
+    {"key": "w", "action": "toggle_teleop",  "label": "遥控 开/关(自动取当前Tracker为零点)", "modes": ["vive"]},
+    {"key": "s", "action": "toggle_record",  "label": "录制 开始/保存"},
+    {"key": "h", "action": "reset_arm",      "label": "复位到起始位(常速)"},
+    {"key": "o", "action": "gripper_open",   "label": "夹爪张开"},
+    {"key": "c", "action": "gripper_close",  "label": "夹爪闭合"},
+    {"key": "1", "action": "gripper_pct", "args": {"pct": 30}, "label": "夹爪 30%"},
+    {"key": "2", "action": "gripper_pct", "args": {"pct": 60}, "label": "夹爪 60%"},
+    {"key": "p", "action": "toggle_gripper_source", "label": "夹爪控制源 Pika主手/键盘 切换(互斥)"},
+    {"key": "q", "action": "quit",           "label": "退出"},
+]
+
+
+def load_keybindings(path):
+    """读取 JSON 按键表; 缺失/损坏时回退到内置默认, 保证脚本仍可运行。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bindings = data.get("bindings") if isinstance(data, dict) else data
+        if not isinstance(bindings, list) or not bindings:
+            raise ValueError("bindings 为空或格式错误")
+        return bindings
+    except (OSError, ValueError) as e:
+        print(f"[!] 按键表 {path} 加载失败({e}), 使用内置默认")
+        return FALLBACK_BINDINGS
+
+
+def binding_available(binding, teaching):
+    """按 modes 字段判断按键在当前模式是否可用 (无 modes = 两种模式通用)。"""
+    modes = binding.get("modes")
+    if not modes:
+        return True
+    return ("teaching" if teaching else "vive") in modes
+
+
+def build_keymap(bindings, teaching):
+    """按键字符 -> binding 映射 (仅收录当前模式可用、且为单键的绑定)。"""
+    keymap = {}
+    for b in bindings:
+        key = b.get("key")
+        if isinstance(key, str) and len(key) == 1 and binding_available(b, teaching):
+            keymap[key] = b
+    return keymap
+
+
+def print_command_table(bindings, teaching):
+    """据按键表打印命令提示 (只列当前模式可用的键)。"""
+    print("-" * 50)
+    print("单键即触发 (无需回车):")
+    for b in bindings:
+        if binding_available(b, teaching):
+            print(f"  [{b.get('key')}] {b.get('label', b.get('action'))}")
+    print("  [Ctrl+C] 强制退出")
+    print("-" * 50)
+
+
+# ============ 动作层 (terminal / web 前端共用) ============
+class CollectorController:
+    """把每个操作封装成命名动作, 供 terminal 与 web 前端共用, 保证两端行为一致。
+
+    - dispatch(name, args): 按动作名分发到 action_<name> 方法;
+    - snapshot()/print_status(): 统一状态, 供 terminal 状态行与后续 web 推送复用;
+    - move_to_init(): 机械臂归位统一入口 (rm_movej_p 关节空间规划到笛卡尔位姿)。
+    """
+
+    _ACTION_PREFIX = "action_"
+
+    def __init__(self, arm, arm_lock, gripper, vive_ctrl, recorder,
+                 save_dir, task_name, teaching=False, pika_teleop=None, converter=None):
+        self.arm = arm
+        self.arm_lock = arm_lock
+        self.gripper = gripper
+        self.vive = vive_ctrl
+        self.recorder = recorder
+        self.save_dir = save_dir
+        self.task_name = task_name
+        self.teaching = teaching
+        # 异步 LeRobot 转换器 (未启用自动转换时为 None); 每条 episode 保存后入队后台转换
+        self.converter = converter
+        # Pika 主手夹爪遥操线程 (未启用时为 None)
+        self.pika_teleop = pika_teleop
+        # 夹爪控制源: pika | keyboard, 二者互斥, 由 toggle_gripper_source 切换。
+        # 有 Pika 主手时默认优先用它(第一选择); 夹爪仅在机械臂遥操开启后跟随。
+        if pika_teleop is not None:
+            self.gripper_source = "pika"
+            pika_teleop.enabled = True
+        else:
+            self.gripper_source = "keyboard"
+        self.quit_requested = False
+        self.saved_count = 0
+        # ROBOT_INIT 合成 6 维笛卡尔位姿 [x,y,z, rx,ry,rz] (米/弧度), 供 movej_p 使用
+        self.robot_init_pose = [float(x) for x in
+                                (list(ROBOT_INIT_POS) + list(ROBOT_INIT_ORI))]
+
+    # ---------- 机械臂归位 ----------
+    def _read_arm_pose(self):
+        """读机械臂当前笛卡尔位姿 [x,y,z,rx,ry,rz] (米/弧度); 失败返回 None。"""
+        try:
+            with self.arm_lock:
+                code, state = self.arm.rm_get_current_arm_state()
+            if code == 0 and state and state.get("pose"):
+                return [float(x) for x in state["pose"][:6]]
+        except Exception:
+            pass
+        return None
+
+    def move_to_init(self, speed, block=1, countdown=0, label="归位", skip_if_near=False,
+                     reset_gripper=True):
+        """rm_movej_p 关节空间规划到 ROBOT_INIT (大位移最稳、不撞奇异点)。
+
+        机械臂全程处于真实模式(run_mode=1), 规划运动直接执行即可 —— 切勿切到
+        run_mode=0(那是"仿真"模式, 指令只在仿真里跑、真实机械臂不动)。
+        失败仅打印告警、不下发危险运动; ret!=0 多为位姿不可达, 见 ROBOT_INIT 标定。
+        skip_if_near=True: 若已在 ROBOT_INIT 附近(位置<ARM_HOME_POS_TOL 且姿态<ARM_HOME_ORI_TOL),
+        直接跳过、不下发运动 —— 供启动慢速归位用, 免得每次重启都无谓地慢速跑一遍。
+        reset_gripper=True: 机械臂到位(或已在附近而跳过运动)后把夹爪也复位到 GRIPPER_RESET_VALUE,
+        保证机械臂与夹爪同时回到一致的起始状态。
+        """
+        if skip_if_near:
+            cur = self._read_arm_pose()
+            if cur is not None:
+                dp, dang = _pose_deviation(cur, self.robot_init_pose)
+                if dp < ARM_HOME_POS_TOL and dang < ARM_HOME_ORI_TOL:
+                    print(f"[i] 已在起始位附近 (位置 {dp * 100:.1f}cm / 姿态 {np.degrees(dang):.1f}°), 跳过{label}")
+                    # 即便跳过机械臂运动, 仍复位夹爪, 保证起始状态一致
+                    if reset_gripper:
+                        self.reset_gripper()
+                    return True
+        if countdown > 0:
+            print(f"[!] 机械臂即将{label}到起始位, 请清空周围! {countdown} 秒后开始...")
+            for i in range(countdown, 0, -1):
+                print(f"    {i}...", flush=True)
+                time.sleep(1.0)
+        # 非阻塞下发: 只在发送指令的瞬间持锁, 随即释放, 让录制线程能在归位过程中持续
+        # 采到机械臂真实轨迹。切勿用 block=1 —— 它会全程持锁数秒, 饿死录制线程,
+        # 导致这段归位运动一帧都没录进 episode (表现为"复位数据被跳过")。
+        with self.arm_lock:
+            ret = self.arm.rm_movej_p(self.robot_init_pose, int(speed), 0, 0, 0)
+        if ret != 0:
+            print(f"[!] {label}失败: rm_movej_p ret={ret} (位姿可能不可达, 检查 ROBOT_INIT 标定)")
+            return False
+        if block:
+            self._wait_until_arrived(label)
+        # 机械臂到位后再复位夹爪: 两者依次回到起始状态, 避免夹爪先张开时机械臂还在大幅运动
+        if reset_gripper:
+            self.reset_gripper()
+        print(f"[✓] {label}完成 (v={speed}%)")
+        return True
+
+    def reset_gripper(self, value=GRIPPER_RESET_VALUE, wait=True,
+                      tol=GRIPPER_RESET_TOL, timeout=GRIPPER_RESET_TIMEOUT):
+        """把夹爪归位到固定开度(默认 GRIPPER_RESET_VALUE=张开), 与机械臂归位配套。
+
+        move_normalized 异步下发, 夹爪按自身 speed_pct 平滑运动(非瞬间传送);
+        wait=True 时轮询反馈直到接近目标或超时, 避免后续遥操/录制读到未到位的中间值。
+        超时仅告警、不阻塞。
+        """
+        self.gripper.move_normalized(value)
+        if not wait:
+            return
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if abs(self.gripper.get_position_normalized() - value) <= tol:
+                print(f"[✓] 夹爪复位到 {int(value * 100)}%")
+                return
+            time.sleep(0.05)
+        print(f"[!] 夹爪复位等待到位超时 ({timeout:.0f}s): 可能未使能/总线抖动, 当前 "
+              f"{int(self.gripper.get_position_normalized() * 100)}%")
+
+    def _wait_until_arrived(self, label, timeout=60.0, poll=0.05):
+        """轮询等待机械臂到达 ROBOT_INIT (配合非阻塞 movej_p 使用)。
+
+        每次只短暂持锁读一次位姿、随即释放并 sleep, 空档让录制线程采到归位轨迹;
+        到位(位置<ARM_HOME_POS_TOL 且姿态<ARM_HOME_ORI_TOL)即返回。超时仅告警不阻塞。
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            cur = self._read_arm_pose()
+            if cur is not None:
+                dp, dang = _pose_deviation(cur, self.robot_init_pose)
+                if dp < ARM_HOME_POS_TOL and dang < ARM_HOME_ORI_TOL:
+                    return True
+            time.sleep(poll)
+        print(f"[!] {label}等待到位超时 ({timeout:.0f}s): 机械臂可能未使能/被限位/急停, 或 ret=0 却没动")
+        return False
+
+    # ---------- 动作 (每个 action_<name> 对应按键表里的一个动作) ----------
+    def action_calibrate_vive(self, **_):
+        if self.teaching:
+            print("[i] 示教模式无 Vive 校准")
+            return
+        self.vive.calibrate()
+
+    def action_toggle_teleop(self, **_):
+        """单键 toggle: 遥控 开<->关 (原 w/e 合并)。"""
+        if self.teaching:
+            print("[i] 示教模式无遥操")
+            return
+        if self.vive.control_enabled:
+            self.vive.disable()
+        else:
+            self.vive.enable()
+        self.print_status()
+
+    def action_toggle_record(self, **_):
+        """单键 toggle: 录制 开始<->停止并保存 (原 s/d 合并), 自动递增文件名。
+
+        停止时先暂停遥操再保存: 按 s 立即让机械臂停止跟随手(不必等落盘),
+        随后 _save() 阻塞期间机械臂已静止, 便于复位/摆场景、也防误动;
+        下一条 episode 需重新按 w 启用(会以机械臂当前位姿重新取零点)。
+        """
+        if self.recorder.is_recording:
+            # 先暂停遥操: 避免随后的阻塞式 _save() 期间机械臂仍跟随手(lzf 后保存变快, 这段延迟更明显)
+            teleop_was_on = not self.teaching and self.vive.control_enabled
+            if teleop_was_on:
+                self.vive.disable()
+            saved = self.recorder.stop()
+            self.saved_count += 1
+            # 保存成功且启用了自动转换: 入队后台异步转 LeRobot (不阻塞; 转完删除 HDF5)
+            if saved and self.converter is not None:
+                self.converter.enqueue(saved)
+            if teleop_was_on:
+                print("[i] 录制结束已保存, 遥操已自动暂停 (下条按 w 重新启用)")
+        else:
+            filename = get_next_filename(self.save_dir, self.task_name)
+            self.recorder.start(filename)
+        self.print_status()
+
+    def action_reset_arm(self, **_):
+        """复位键: 常速归位到 ROBOT_INIT。复位前自动暂停遥操 (需手动按 w 重新启用)。
+
+        录制中也允许复位: 归位运动会照常录进当前 episode (按需求不拦截)。
+        """
+        if not self.teaching and self.vive.control_enabled:
+            self.vive.disable()
+            time.sleep(0.15)   # 等一个控制周期, 让在途透传指令发完, 避免与归位争锁后补发旧位姿
+            print("[i] 复位前已暂停遥操; 如需遥操请按 w 重新启用 (自动取当前位姿为零点)")
+        if self.recorder.is_recording:
+            print("[i] 录制中复位: 归位运动会录进当前 episode")
+        self.move_to_init(ARM_HOME_SPEED_NORMAL, block=1, countdown=0, label="复位")
+        self.print_status()
+
+    def _gripper_keyboard_blocked(self):
+        """当前为 Pika 主手控制时, 键盘夹爪键被拦截(互斥), 返回 True 表示已拦下。"""
+        if self.gripper_source == "pika":
+            print("[i] 当前为 Pika 主手控制夹爪, 键盘夹爪键已禁用 (按切换键回到键盘)")
+            return True
+        return False
+
+    def action_gripper_open(self, **_):
+        if self._gripper_keyboard_blocked():
+            return
+        self.gripper.open()
+        print("夹爪: 张开")
+
+    def action_gripper_close(self, **_):
+        if self._gripper_keyboard_blocked():
+            return
+        self.gripper.close()
+        print("夹爪: 闭合")
+
+    def action_gripper_pct(self, pct=100, **_):
+        if self._gripper_keyboard_blocked():
+            return
+        pct = max(0, min(100, int(pct)))
+        self.gripper.move_pct(pct)
+        print(f"夹爪: {pct}%")
+
+    def action_toggle_gripper_source(self, **_):
+        """切换夹爪控制源: Pika 主手 <-> 键盘 (互斥; 默认 Pika 主手)。
+
+        切到 Pika: 仅当机械臂遥操已开启(w)时从手才跟随主手当前开合
+        (主手在最大张开则从手张开到底, 属预期); 切到键盘: Pika 线程停写, 键盘 o/c/1/2/3 恢复。
+        """
+        if self.pika_teleop is None:
+            print("[i] 本次未启用 Pika 夹爪 (--no-pika-gripper 或连接失败), 仍用键盘控制")
+            return
+        if self.gripper_source == "keyboard":
+            self.gripper_source = "pika"
+            self.pika_teleop.enabled = True
+            print("[i] 夹爪控制源 → Pika 主手 (键盘夹爪键暂停; 需按 w 开启遥操后从手才跟随主手)")
+        else:
+            self.gripper_source = "keyboard"
+            self.pika_teleop.enabled = False
+            print("[i] 夹爪控制源 → 键盘 (Pika 主手暂停)")
+        self.print_status()
+
+    def action_quit(self, **_):
+        self.quit_requested = True
+
+    # ---------- 分发 / 状态 ----------
+    def dispatch(self, name, args=None):
+        """按动作名分发; 单个动作异常不中断采集循环。"""
+        method = getattr(self, self._ACTION_PREFIX + str(name), None)
+        if not callable(method):
+            print(f"[!] 未知动作: {name}")
+            return False
+        try:
+            method(**(args or {}))
+        except Exception as e:  # noqa: BLE001 - 单个动作异常不应中断整个采集循环
+            print(f"[!] 动作 {name} 异常: {e}")
+        return True
+
+    def snapshot(self):
+        """当前状态快照 (terminal 状态行 / 后续 web 推送共用)。"""
+        return {
+            "mode": "teaching" if self.teaching else "vive",
+            "teleop": bool(self.vive.control_enabled) if not self.teaching else False,
+            "recording": bool(self.recorder.is_recording),
+            "saved": int(self.saved_count),
+            "gripper": round(float(self.gripper.get_position_normalized()), 3),
+            "gripper_source": self.gripper_source,
+            "quit": bool(self.quit_requested),
+        }
+
+    def print_status(self):
+        s = self.snapshot()
+        teleop = "启用" if s["teleop"] else "暂停"
+        rec = "录制中" if s["recording"] else "空闲"
+        src = "Pika主手" if s["gripper_source"] == "pika" else "键盘"
+        print(f"[状态] 遥控:{teleop} | {rec} | 已存 {s['saved']} 条 | "
+              f"夹爪 {int(s['gripper'] * 100)}% (控制源:{src})")
 
 
 # ============ 主程序 ============
@@ -497,12 +1307,61 @@ def main():
     parser.add_argument('--cam-wrist', type=str, default=DEFAULT_CAM_WRIST_SERIAL, help='腕部相机(Orbbec 305)序列号，留空取第一个设备')
     parser.add_argument('--gripper-port', type=str, default=GRIPPER_PORT, help='知行夹爪串口')
     parser.add_argument('--gripper-slave-id', type=int, default=GRIPPER_SLAVE_ID, help='知行夹爪 Modbus 从站地址')
+    parser.add_argument('--gripper-speed', type=int, default=GRIPPER_SPEED_PCT,
+                        help='夹爪电机行程速度(0~100, 越大开合越快; 夹持力由 force_pct 独立限制, 提速不增力), '
+                             '默认 %(default)s; 嫌太猛可下调 (须与推理端一致)')
+    parser.add_argument('--gripper-poll-hz', type=float, default=GRIPPER_POLL_HZ,
+                        help='夹爪 RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz; 本机总线有抖动不宜过高, 默认 %(default)s')
+    parser.add_argument('--pika-gripper', action=argparse.BooleanOptionalAction, default=True,
+                        help='启用 Pika Sense 主手夹爪作为首选夹爪控制源(与键盘互斥, 按 p 切换); 默认开, --no-pika-gripper 关')
+    parser.add_argument('--pika-port', type=str, default=PIKA_GRIPPER_PORT,
+                        help='Pika Sense 串口(默认 %(default)s)')
+    parser.add_argument('--pika-hz', type=float, default=PIKA_TELEOP_HZ,
+                        help='Pika 主手→从手映射下发频率(Hz), 默认 %(default)s')
+    parser.add_argument('--pika-ramp-rate', type=float, default=PIKA_TELEOP_RAMP_RATE,
+                        help='从手逼近主手的归一化限速(单位/秒): 全程 0→1 约 1/rate 秒, '
+                             '把开启遥操瞬间的夹爪突跳摊成平滑斜坡; ≤0 关闭限速, 默认 %(default)s')
     parser.add_argument('--save-dir', type=str, default='data/raw_hdf5', help='数据保存目录')
     parser.add_argument('--task-name', type=str, default='task_pick_cube', help='任务名称')
     parser.add_argument('--fps', type=int, default=30, help='采集帧率')
     parser.add_argument('--tracker-serial', type=str, default=DEFAULT_TRACKER_SERIAL,
                         help='Vive Tracker 序列号（留空或保留占位符则自动选第一个 tracker）')
     parser.add_argument('--teaching', action='store_true', help='示教模式（不用Vive）')
+    parser.add_argument('--keybindings', type=str, default=DEFAULT_KEYBINDINGS_PATH,
+                        help='按键表 JSON 路径（terminal/web 前端共用）')
+    parser.add_argument('--no-home', action='store_true',
+                        help='启动时不自动慢速归位到 ROBOT_INIT')
+    parser.add_argument('--home-countdown', type=int, default=ARM_HOME_COUNTDOWN,
+                        help='启动归位前倒计时秒数（0=不倒计时）')
+    parser.add_argument('--control-hz', type=float, default=VIVE_CONTROL_HZ,
+                        help='Vive 遥操透传频率(Hz)，越高跟随越紧延迟越低，默认 %(default)s')
+    parser.add_argument('--high-follow', action=argparse.BooleanOptionalAction, default=VIVE_FOLLOW_HIGH,
+                        help='高跟随模式(follow=True)：滞后最小，要求透传≥100Hz(不足自动抬到100)。'
+                             '默认开；用 --no-high-follow 关(改回低跟随，控制器自规划更软)')
+    parser.add_argument('--traj-mode', type=int, default=VIVE_TRAJ_MODE, choices=[0, 1, 2],
+                        help='高跟随控制器侧轨迹平滑(治伺服嗡颤)：0=完全透传 1=曲线拟合 2=滤波(默认)，默认 %(default)s')
+    parser.add_argument('--traj-radio', type=int, default=VIVE_TRAJ_RADIO,
+                        help='轨迹平滑系数：拟合0~100/滤波0~1000，越大越平滑滞后越大，默认 %(default)s')
+    parser.add_argument('--oe-mincutoff', type=float, default=VIVE_OE_MINCUTOFF,
+                        help='One Euro 零速截止频率(Hz)，越低越压静止手抖(慢速滞后略增)，默认 %(default)s')
+    parser.add_argument('--oe-beta', type=float, default=VIVE_OE_BETA,
+                        help='One Euro 速度系数，越大快速运动越跟手；默认 %(default)s(刻意低=重阻尼防跟随太快)，嫌拖调大(经验10~30)')
+    # ---- 异步转 LeRobot (采完每条 episode 后台转成数据集, 没有则新建/有则 resume 追加) ----
+    parser.add_argument('--auto-convert', action=argparse.BooleanOptionalAction, default=True,
+                        help='每条 episode 保存后异步转成 LeRobot 数据集(不存在则新建, 存在则 resume 追加), 转完删除 HDF5; 默认开, --no-auto-convert 关(仅留 HDF5)')
+    parser.add_argument('--lerobot-dir', type=str, default=None,
+                        help='LeRobot 数据集输出目录(默认 data/datasets/<task_name>_lerobot)')
+    parser.add_argument('--repo-id', type=str, default=None,
+                        help='LeRobot 数据集 repo-id(默认 realman/<task_name>)')
+    parser.add_argument('--task', type=str, default='pick up the cube and place it in the basket',
+                        help='任务描述(VLA 训练/推理需完全一致), 默认 %(default)s')
+    parser.add_argument('--vcodec', type=str, default='h264',
+                        choices=['h264', 'hevc', 'libsvtav1'],
+                        help='LeRobot 视频编码器(默认 h264; 比 LeRobot 默认的 libsvtav1/AV1 快数倍)')
+    parser.add_argument('--image-writer-processes', type=int, default=4,
+                        help='转 LeRobot 时并行写 PNG 帧的进程数(0=串行), 默认 %(default)s')
+    parser.add_argument('--image-writer-threads', type=int, default=4,
+                        help='转 LeRobot 时并行写 PNG 帧的线程数(0=串行), 默认 %(default)s')
     args = parser.parse_args()
 
     # 导入机械臂SDK
@@ -532,6 +1391,7 @@ def main():
     gripper = ChangingtekGripper(
         port=args.gripper_port, slave_id=args.gripper_slave_id,
         baudrate=GRIPPER_BAUDRATE, max_position=GRIPPER_MAX_POSITION,
+        speed_pct=args.gripper_speed, poll_hz=args.gripper_poll_hz,
     )
     gripper.connect()
     print(f"夹爪: {'OK' if gripper.connected else 'FAIL'} ({args.gripper_port})")
@@ -540,7 +1400,14 @@ def main():
     # 初始化 Vive 遥控（未连接时会阻塞等待直到 Tracker 就绪，Ctrl+C 可中断）
     try:
         vive_ctrl = ViveController(arm, arm_lock, tracker_serial=args.tracker_serial,
-                                   enable_vive=not args.teaching)
+                                   enable_vive=not args.teaching,
+                                   control_hz=args.control_hz,
+                                   follow_high=args.high_follow,
+                                   traj_mode=args.traj_mode,
+                                   traj_radio=args.traj_radio,
+                                   oe_mincutoff=args.oe_mincutoff,
+                                   oe_beta=args.oe_beta,
+                                   oe_dcutoff=VIVE_OE_DCUTOFF)
     except KeyboardInterrupt:
         print("\n[!] 已取消：等待 Vive 连接被中断")
         cam_top.close()
@@ -553,79 +1420,99 @@ def main():
     # 初始化录制器
     recorder = DataRecorder(arm, arm_lock, gripper, cam_top, cam_wrist, args.fps)
 
-    print("\n" + "-" * 50)
-    if args.teaching:
-        print("命令: s=录制  d=保存  g <0-100>=夹爪  c=闭合  o=打开  q=退出")
-    else:
-        print("命令: v=校准  w=遥控  e=停止  s=录制  d=保存")
-        print("      g <0-100>=夹爪  c=闭合  o=打开  q=退出")
-    print("-" * 50)
+    # 异步 LeRobot 转换器: 每条 episode 保存后后台转成数据集(没有则新建/有则 resume 追加), 转完删 HDF5。
+    # 惰性: 仅在 --auto-convert 时引入 torch/lerobot; 初始化失败不阻断采集(退回仅存 HDF5)。
+    converter = None
+    if args.auto_convert:
+        lerobot_dir = args.lerobot_dir or os.path.join('data', 'datasets', f'{args.task_name}_lerobot')
+        repo_id = args.repo_id or f'realman/{args.task_name}'
+        try:
+            converter = LeRobotAsyncConverter(
+                lerobot_dir=lerobot_dir, repo_id=repo_id, fps=args.fps, task=args.task,
+                vcodec=args.vcodec,
+                image_writer_processes=args.image_writer_processes,
+                image_writer_threads=args.image_writer_threads)
+            print(f"自动转换: 开 → {lerobot_dir} (repo-id {repo_id}, fps {args.fps}, vcodec {args.vcodec})")
+        except Exception as e:  # noqa: BLE001 - 转换不可用不应阻断采集
+            print(f"[!] 自动转换初始化失败({e}), 本次仅保存 HDF5")
+            converter = None
+
+    # 可选: Pika Sense 主手夹爪 (首选夹爪控制源, 与键盘互斥; 默认开启)
+    # 惰性导入: 仅在启用时才引入 vendor/pika_sdk, 未 clone submodule 也不影响常规采集。
+    pika_master = None
+    pika_teleop = None
+    if args.pika_gripper:
+        from pika_gripper import PikaGripperMaster
+        pika_master = PikaGripperMaster(port=args.pika_port)
+        if pika_master.connect():
+            print(f"Pika 主手夹爪: OK ({args.pika_port}) "
+                  f"行程 {pika_master.min_mm:.0f}~{pika_master.max_mm:.0f}mm")
+            # 遥操门控: Vive 模式下仅当机械臂遥操已开启(w)时夹爪才跟随主手;
+            # 示教模式无遥操概念, 不门控(gate=None), 夹爪随控制源生效。
+            teleop_gate = None if args.teaching else (lambda: vive_ctrl.control_enabled)
+            pika_teleop = PikaGripperTeleop(pika_master, gripper, hz=args.pika_hz,
+                                            ramp_rate=args.pika_ramp_rate,
+                                            teleop_gate=teleop_gate)
+            if args.teaching:
+                print("[i] 夹爪控制源默认 Pika 主手 (示教模式无遥操门控; 按 p 切到键盘)")
+            else:
+                print("[i] 夹爪控制源默认 Pika 主手; 按 w 开启遥操后夹爪才跟随主手 (按 p 切到键盘)")
+        else:
+            print(f"[!] Pika 主手夹爪连接失败 ({args.pika_port}), 本次仅用键盘控制")
+            pika_master = None
+
+    # 动作层: terminal 与(后续)web 前端共用同一套命名动作
+    controller = CollectorController(
+        arm, arm_lock, gripper, vive_ctrl, recorder,
+        save_dir=args.save_dir, task_name=args.task_name, teaching=args.teaching,
+        pika_teleop=pika_teleop, converter=converter,
+    )
+
+    # 启动慢速归位 (按要求放在 Vive 连接之后): 上电后位姿未知, 慢速求稳;
+    # skip_if_near=True: 已在 ROBOT_INIT 附近就跳过, 不做无谓的慢速运动
+    if not args.no_home:
+        controller.move_to_init(ARM_HOME_SPEED_SLOW, block=1,
+                                countdown=max(0, args.home_countdown), label="慢速归位",
+                                skip_if_near=True)
+
+    # 加载按键表 (terminal/web 共用 JSON), 据此生成命令提示与单键映射
+    bindings = load_keybindings(args.keybindings)
+    keymap = build_keymap(bindings, args.teaching)
+    print()
+    print_command_table(bindings, args.teaching)
 
     old_settings = termios.tcgetattr(sys.stdin)
-    cmd_buffer = ""
-
     try:
         tty.setcbreak(sys.stdin.fileno())
-        print("> ", end='', flush=True)
-
-        while True:
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
-            if rlist:
-                char = sys.stdin.read(1)
-                if char == '\n':
-                    cmd = cmd_buffer.strip()
-                    if cmd == 'q':
-                        print()
-                        break
-                    elif cmd == 'v' and not args.teaching:
-                        print(); vive_ctrl.calibrate()
-                    elif cmd == 'w' and not args.teaching:
-                        print(); vive_ctrl.enable()
-                    elif cmd == 'e' and not args.teaching:
-                        print(); vive_ctrl.disable()
-                    elif cmd == 's':
-                        print()
-                        filename = get_next_filename(args.save_dir, args.task_name)
-                        recorder.start(filename)
-                    elif cmd == 'd':
-                        print(); recorder.stop()
-                    elif cmd.startswith('g '):
-                        print()
-                        try:
-                            val = max(0, min(100, int(cmd.split()[1])))
-                            gripper.move_pct(val)
-                            print(f"夹爪: {val}%")
-                        except Exception:
-                            print("格式: g <0-100>")
-                    elif cmd == 'c':
-                        print()
-                        gripper.close()
-                        print("夹爪: 闭合")
-                    elif cmd == 'o':
-                        print()
-                        gripper.open()
-                        print("夹爪: 打开")
-                    elif cmd:
-                        print("\n未知命令")
-                    cmd_buffer = ""
-                    print("> ", end='', flush=True)
-                elif char == '\x7f':
-                    if cmd_buffer:
-                        cmd_buffer = cmd_buffer[:-1]
-                        sys.stdout.write('\b \b')
-                        sys.stdout.flush()
-                else:
-                    cmd_buffer += char
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
+        controller.print_status()
+        # 单键即触发: 读到一个字符立刻查表分发, 无需回车
+        while not controller.quit_requested:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not rlist:
+                continue
+            char = sys.stdin.read(1)
+            if char == '\x03':            # Ctrl+C 兜底 (cbreak 下一般已抛 KeyboardInterrupt)
+                break
+            binding = keymap.get(char) or keymap.get(char.lower())
+            if binding:
+                controller.dispatch(binding["action"], binding.get("args"))
 
     except KeyboardInterrupt:
         print("\n")
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         if recorder.is_recording:
-            recorder.stop()
+            saved = recorder.stop()
+            if saved and converter is not None:
+                converter.enqueue(saved)
+        # 排空后台转换队列(把本次未转完的 episode 全部转完)后再释放硬件
+        if converter is not None:
+            converter.shutdown()
         vive_ctrl.shutdown()
+        if pika_teleop is not None:
+            pika_teleop.shutdown()
+        if pika_master is not None:
+            pika_master.disconnect()
         cam_top.close()
         cam_wrist.close()
         gripper.disable()
