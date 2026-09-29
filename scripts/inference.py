@@ -303,6 +303,10 @@ def main():
                         help='EMA 系数 (默认 %(default)s; 1.0=不平滑)')
     parser.add_argument('--deadzone', type=float, default=0.5,
                         help='关节死区阈值(度), 默认 %(default)s; 0=不过滤')
+    parser.add_argument('--print-step', action='store_true',
+                        help='打印每个控制步的状态和耗时；默认关闭')
+    parser.add_argument('--reset-and-run', action='store_true',
+                        help='等待用户输入 r，复位机械臂到 INIT_POSE 后开始推理')
     args = parser.parse_args()
     if not math.isfinite(args.freq) or args.freq <= 0:
         parser.error('--freq 必须为正的有限数')
@@ -406,8 +410,15 @@ def main():
     time.sleep(1)
 
     # 3. 移动到初始位姿
-    print("\n[3/5] Moving to initial pose...")
-    robot.move_to_init(INIT_POSE)
+    if args.reset_and_run:
+        print("\n[3/5] 输入 r 并按 Enter，复位机械臂后开始推理；输入其他内容跳过复位")
+        if input().strip().lower() == 'r':
+            print("      Resetting arm before inference...")
+            robot.move_to_init(INIT_POSE)
+        else:
+            print("      Skipping arm reset")
+    else:
+        print("\n[3/5] Arm reset disabled (use --reset-and-run to wait for r)")
 
     # 4. 等待确认
     print("\n[4/5] Ready to execute")
@@ -546,7 +557,7 @@ def main():
                 timings['sleep'] = time.perf_counter() - t0
 
             # 日志放在 sleep 之后，确保包含完整一轮的关键步骤耗时。
-            if step_count % 1 == 0:
+            if args.print_step:
                 joints_str = " ".join(
                     f"J{i + 1}:{qpos[i]:6.1f}→{action[i]:6.1f}" for i in range(6)
                 )

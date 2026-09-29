@@ -91,6 +91,10 @@ the existing stop/homing cleanup. Use `--no-rtc` for serial execution;
 `--wait-for-next-chunk` automatically selects serial mode and conflicts with
 explicit `--rtc`. No checkpoint retraining is required.
 
+Per-step control logs are disabled by default; add `--print-step` to enable them.
+With `--reset-and-run`, the program waits for the user to enter `r`, then moves
+to `INIT_POSE` and starts inference.
+
 Hardware-free checks: `.venv/bin/python -m unittest discover -s tests -v`.
 
 ---
