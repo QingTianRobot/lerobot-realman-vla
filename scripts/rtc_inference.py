@@ -142,6 +142,20 @@ class RTCInference:
             raise RuntimeError("RTC action queue underrun: inference exceeded the action reserve")
         return action.numpy()
 
+    def reset(self):
+        """Discard queued actions and synchronously prepare a fresh RTC episode."""
+        if self._future is not None:
+            self._future.result()
+            self._future = None
+        self.policy.reset()
+        self.queue.queue = None
+        self.queue.original_queue = None
+        self.queue.last_index = 0
+        self.chunk_id = 0
+        self.last_delay = 0
+        self.last_latency = 0.0
+        self.latency.reset()
+
     def close(self):
         self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)

@@ -306,7 +306,7 @@ def main():
     parser.add_argument('--print-step', action='store_true',
                         help='打印每个控制步的状态和耗时；默认关闭')
     parser.add_argument('--reset-and-run', action='store_true',
-                        help='等待用户输入 r，复位机械臂到 INIT_POSE 后开始推理')
+                        help='启用运行期间按 r 复位机械臂，并清空旧动作后继续推理')
     args = parser.parse_args()
     if not math.isfinite(args.freq) or args.freq <= 0:
         parser.error('--freq 必须为正的有限数')
@@ -409,16 +409,21 @@ def main():
         )
     time.sleep(1)
 
-    # 3. 移动到初始位姿
+    # 3. Optional runtime reset hotkey. The initial arm pose is left untouched.
+    reset_requested = threading.Event()
     if args.reset_and_run:
-        print("\n[3/5] 输入 r 并按 Enter，复位机械臂后开始推理；输入其他内容跳过复位")
-        if input().strip().lower() == 'r':
-            print("      Resetting arm before inference...")
-            robot.move_to_init(INIT_POSE)
-        else:
-            print("      Skipping arm reset")
+        print("\n[3/5] Runtime reset enabled: press 'r' during inference to reset and resume")
+        if args.headless:
+            def _reset_input_loop():
+                while not reset_requested.is_set():
+                    try:
+                        if input().strip().lower() == 'r':
+                            reset_requested.set()
+                    except (EOFError, KeyboardInterrupt):
+                        return
+            threading.Thread(target=_reset_input_loop, name='reset-hotkey', daemon=True).start()
     else:
-        print("\n[3/5] Arm reset disabled (use --reset-and-run to wait for r)")
+        print("\n[3/5] Runtime reset disabled (use --reset-and-run to enable 'r')")
 
     # 4. 等待确认
     print("\n[4/5] Ready to execute")
@@ -451,6 +456,22 @@ def main():
             )
             prev_loop_start = loop_start
             timings = {}
+
+            if reset_requested.is_set():
+                reset_requested.clear()
+                print("\n[RESET] r received: stopping motion and resetting arm...")
+                robot.stop()
+                robot.move_to_init(INIT_POSE)
+                if rtc:
+                    rtc.reset()
+                    action_queue = None
+                else:
+                    policy.reset()
+                    action_queue = _get_action_queue(policy)
+                chunk_id = 0
+                step_count = 0
+                prev_loop_start = None
+                print("[RESET] arm reset complete; inference resumed")
 
             # 仅检查 Future；推理未完成时继续消费已有动作，不等待 GPU。
             if rtc:
@@ -543,8 +564,11 @@ def main():
                         cv2.putText(display, f"{policy_type} Step: {step_count}",
                                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         cv2.imshow("Inference", display)
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
                             break
+                        if args.reset_and_run and key == ord('r'):
+                            reset_requested.set()
                 except cv2.error:
                     args.headless = True
             timings['visualize'] = time.perf_counter() - t0
