@@ -54,6 +54,9 @@ GRIPPER_MAX_POSITION = 9000   # 归一化行程上限兜底值 (设备单位, /1
 GRIPPER_SPEED_PCT = 100       # 电机行程速度(0~100); ⚠ 必须与采集端(collect_data --gripper-speed)一致, 否则开合动态与训练数据不符
 GRIPPER_POLL_HZ = 25          # RS-485 总线轮询频率(Hz): 异步命令最长排队时延=1/hz
 GRIPPER_DEADBAND = 0.02       # 与 collect_data.py 的 PIKA_TELEOP_DEADBAND 一致，减少无效 RTU 写入
+# 归一化语义: 0=闭合, 1=张开。负补偿让夹爪实际更闭合，改善抓取稳定性。
+# 所有推理动作在真正下发到夹爪前统一加上该值，并裁剪到 [0, 1]。
+GRIPPER_COMPENSATION = -0.03
 
 # 与 collect_data.py ROBOT_INIT_POS + ROBOT_INIT_ORI 保持一致 (笛卡尔位姿 [x,y,z,rx,ry,rz], 米/弧度)
 INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.float32)
@@ -195,7 +198,9 @@ class RobotController:
 
             # 夹爪（知行 RTU 内部异步下发）。与 collect_data 一样直接使用连续的
             # 归一化目标：0=闭合、1=张开；死区仅用于避免重复写入 RS-485 总线。
-            gripper_target = float(np.clip(qpos[6], 0.0, 1.0))
+            gripper_target = float(np.clip(
+                qpos[6] + GRIPPER_COMPENSATION, 0.0, 1.0
+            ))
             if (self._last_gripper_cmd is None or
                     abs(gripper_target - self._last_gripper_cmd) >= GRIPPER_DEADBAND):
                 self.gripper.move_normalized(gripper_target)

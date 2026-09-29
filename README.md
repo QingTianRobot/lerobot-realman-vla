@@ -265,6 +265,8 @@ RTC 使用原生引导，不需要重新训练 checkpoint。
 
 逐步控制日志默认关闭；需要时添加 `--print-step`。添加 `--reset-and-run` 后，推理运行期间直接按 `r`（无需 Enter）会停止当前动作、复位到 `INIT_POSE`、清空旧动作队列，然后继续推理；可重复触发。
 
+夹爪实际下发值会统一加上 `scripts/inference.py` 中的 `GRIPPER_COMPENSATION`（当前为 `-0.03`）。由于归一化值 `0` 表示闭合、`1` 表示张开，负值会让夹爪额外闭合以提高抓取稳定性。
+
 无需连接硬件的 RTC 回归检查：
 
 ```bash

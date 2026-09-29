@@ -96,6 +96,11 @@ With `--reset-and-run`, pressing `r` during inference (no Enter required) stops
 the current motion, moves to `INIT_POSE`, clears stale actions, and resumes
 inference. It can be triggered repeatedly.
 
+Gripper commands receive the `GRIPPER_COMPENSATION` constant in
+`scripts/inference.py` before being sent. It is currently `-0.03`: normalized
+`0` means closed and `1` means open, so the negative offset closes slightly
+further to improve grip stability.
+
 Hardware-free checks: `.venv/bin/python -m unittest discover -s tests -v`.
 
 ---
