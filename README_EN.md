@@ -92,8 +92,9 @@ the existing stop/homing cleanup. Use `--no-rtc` for serial execution;
 explicit `--rtc`. No checkpoint retraining is required.
 
 Per-step control logs are disabled by default; add `--print-step` to enable them.
-With `--reset-and-run`, pressing `r` during inference stops the current motion,
-moves to `INIT_POSE`, clears stale actions, and resumes inference.
+With `--reset-and-run`, pressing `r` during inference (no Enter required) stops
+the current motion, moves to `INIT_POSE`, clears stale actions, and resumes
+inference. It can be triggered repeatedly.
 
 Hardware-free checks: `.venv/bin/python -m unittest discover -s tests -v`.
 

@@ -34,6 +34,9 @@ import cv2
 import json
 import argparse
 import math
+import select
+import termios
+import tty
 from importlib.metadata import version
 from pathlib import Path
 
@@ -411,16 +414,28 @@ def main():
 
     # 3. Optional runtime reset hotkey. The initial arm pose is left untouched.
     reset_requested = threading.Event()
+    reset_listener_stop = threading.Event()
     if args.reset_and_run:
         print("\n[3/5] Runtime reset enabled: press 'r' during inference to reset and resume")
         if args.headless:
             def _reset_input_loop():
-                while not reset_requested.is_set():
-                    try:
-                        if input().strip().lower() == 'r':
+                # Read one key at a time; no Enter is required. Keep listening
+                # after each reset so the feature can be used repeatedly.
+                fd = sys.stdin.fileno()
+                try:
+                    old_settings = termios.tcgetattr(fd)
+                    tty.setcbreak(fd)
+                    while not reset_listener_stop.is_set():
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                        if ready and sys.stdin.read(1).lower() == 'r':
                             reset_requested.set()
-                    except (EOFError, KeyboardInterrupt):
-                        return
+                except (EOFError, OSError, termios.error):
+                    pass
+                finally:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    except (UnboundLocalError, OSError, termios.error):
+                        pass
             threading.Thread(target=_reset_input_loop, name='reset-hotkey', daemon=True).start()
     else:
         print("\n[3/5] Runtime reset disabled (use --reset-and-run to enable 'r')")
@@ -603,6 +618,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\n推理终止")
     finally:
+        reset_listener_stop.set()
         # Shutdown order matters: stop camera SDK worker threads before native
         # arm/gripper teardown. Otherwise Ctrl+C can make a C++ destructor join
         # its own callback thread (std::system_error: Resource deadlock avoided).
