@@ -56,7 +56,7 @@ GRIPPER_POLL_HZ = 25          # RS-485 总线轮询频率(Hz): 异步命令最�
 GRIPPER_DEADBAND = 0.02       # 与 collect_data.py 的 PIKA_TELEOP_DEADBAND 一致，减少无效 RTU 写入
 # 归一化语义: 0=闭合, 1=张开。负补偿让夹爪实际更闭合，改善抓取稳定性。
 # 所有推理动作在真正下发到夹爪前统一加上该值，并裁剪到 [0, 1]。
-GRIPPER_COMPENSATION = -0.03
+GRIPPER_COMPENSATION = -0.02
 
 # 与 collect_data.py ROBOT_INIT_POS + ROBOT_INIT_ORI 保持一致 (笛卡尔位姿 [x,y,z,rx,ry,rz], 米/弧度)
 INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.float32)

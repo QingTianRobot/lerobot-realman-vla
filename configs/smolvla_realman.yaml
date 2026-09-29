@@ -9,21 +9,21 @@
 #   python -m lerobot.scripts.lerobot_train --config configs/smolvla_realman.yaml
 
 dataset:
-  repo_id: lerobot/pick_cube_30fps
-  root: data/pick_cube_30fps
+  repo_id: local_dataset
+  root: data/datasets/20260924_SZTU_trimmed/20260924_SZTU_trimmed
   video_backend: pyav
 
 policy:
   type: smolvla
-  repo_id: your_name/smolvla_realman_pick_cube
+  repo_id: yixiaoshen/smolvla_20260924_realman_pick_plug
 
   # SmolVLA 核心参数
-  n_obs_steps: 1
+  n_obs_steps: 4
   chunk_size: 50
-  n_action_steps: 50
+  n_action_steps: 20
 
-  # VLM 骨干
-  vlm_model_name: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+  # VLM 骨干 (使用本地缓存，避免网络问题)
+  vlm_model_name: models/SmolVLM2-500M-Video-Instruct
   load_vlm_weights: true
 
   # 图像预处理
@@ -51,25 +51,29 @@ policy:
   optimizer_grad_clip_norm: 10.0
 
   # 学习率调度
-  scheduler_warmup_steps: 1000
-  scheduler_decay_steps: 30000
+  scheduler_warmup_steps: 2000
+  scheduler_decay_steps: 50000
   scheduler_decay_lr: 2.5e-6
 
 batch_size: 4
-steps: 50000
+steps: 100000
 
 save_checkpoint: true
-save_freq: 2500
-eval_freq: 5000
-log_freq: 50
+save_freq: 10000
+eval_freq: 5000   # 每10K步评估
+log_freq: 100      # 每100步记录
 
-output_dir: outputs/smolvla_realman_pick_cube
+output_dir: outputs/smolvla_realman_sztu
 
 seed: 42
-num_workers: 2
+num_workers: 8
 
 wandb:
-  enable: false
+  enable: true          # 开启
+  project: smolvla_realman    # 项目名
+  entity: fusedbuzzer-awd       # 你的 W&B 用户名/团队名
+  notes: "smolVLA, SZTU trimmed dataset, 118 episodes, RealMan RM65"
+  run_id: 20260927                # null=自动生成，指定则续接同一 run
 
 # 显存估算:
 # freeze + train_expert_only: ~10-14GB
