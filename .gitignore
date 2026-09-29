@@ -65,3 +65,10 @@ hardware/pika_calibration.json
 
 /models
 /fixes
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Private (面试材料，不纳入开源)
+_private/
+/models
