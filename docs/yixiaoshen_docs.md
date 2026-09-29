@@ -14,4 +14,4 @@ source ./env.sh
 python scripts/inference.py \
     --model /home/robot/repo/lerobot-realman-vla/outputs/smolvla_realman_sztu/checkpoints/100000/pretrained_model \
     --task "pick up the plug and place it in the box" \
-    --freq 30 --ema-alpha 0.3 --deadzone 1 --offline --headless
+    --freq 30 --ema-alpha 0.7 --deadzone 0 --offline --headless

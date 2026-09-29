@@ -186,7 +186,8 @@ class RobotController:
                     should_send = False
 
             if should_send:
-                self.arm.rm_movej(joint_target.tolist(), 30, 1, 0, 1)
+                # CANFD 透传：控制循环按 30 Hz 下发，使用低跟随模式。
+                self.arm.rm_movej_canfd(joint_target.tolist(), False, 0, 0, 0)
                 self._last_joint_cmd = joint_target.copy()
 
             # 夹爪（知行 RTU 内部异步下发）。与 collect_data 一样直接使用连续的
@@ -388,10 +389,20 @@ def main():
 
     action_queue = _get_action_queue(policy)   # 须在 reset() 之后取, 保证与 select_action 同一 deque
     chunk_id = 0
+    prev_loop_start = None
 
     try:
         while True:
-            start_time = time.time()
+            # 用单调时钟记录循环起点；实际频率定义为相邻两次循环起点的时间差，
+            # 因而包含本轮处理耗时和上一轮 sleep/调度抖动。
+            loop_start = time.perf_counter()
+            actual_freq = (
+                1.0 / (loop_start - prev_loop_start)
+                if prev_loop_start is not None and loop_start > prev_loop_start
+                else 0.0
+            )
+            prev_loop_start = loop_start
+            timings = {}
 
             # chunk 边界检测: 队列空 → 本步将触发一次前向重规划(新 chunk)
             if action_queue is not None:
@@ -401,9 +412,12 @@ def main():
 
             # 在采集观测前等待，以确保确认后使用的是最新画面和机械臂状态。
             if is_new_chunk and args.wait_for_next_chunk:
+                t0 = time.perf_counter()
                 wait_for_next_chunk(chunk_id + 1)
+                timings['wait'] = time.perf_counter() - t0
 
             # 获取观测
+            t0 = time.perf_counter()
             qpos = robot.get_qpos()
             observation = {
                 'observation.state': torch.from_numpy(qpos).float(),
@@ -419,38 +433,37 @@ def main():
                 image_tensor, frame_bgr = _capture_image_tensor(cam_wrist)
                 observation['observation.images.camera_left'] = image_tensor
                 display_frames.append(frame_bgr)
+            timings['observe'] = time.perf_counter() - t0
 
             # VLA 需要 language instruction
             if policy_type in ("pi05", "smolvla"):
                 observation['task'] = args.task
 
             # 预处理 → 推理 → 后处理
+            t0 = time.perf_counter()
             observation = preprocessor(observation)
+            timings['preprocess'] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             with torch.no_grad():
                 action_tensor = policy.select_action(observation)
+            timings['inference'] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             action_dict = postprocessor({'action': action_tensor})
             action = action_dict['action'][0].cpu().numpy()
+            timings['postprocess'] = time.perf_counter() - t0
 
             if is_new_chunk:
                 chunk_id += 1
 
             # 执行
+            t0 = time.perf_counter()
             robot.set_qpos(action)
-
-            # 日志
-            elapsed = time.time() - start_time
-            if step_count % 1 == 0:
-                actual_freq = 1.0 / elapsed if elapsed > 0 else 0
-                joints_str = " ".join(
-                    f"J{i + 1}:{qpos[i]:6.1f}→{action[i]:6.1f}" for i in range(6)
-                )
-                print(f"[{policy_type}] Step {step_count:4d} | Chunk {chunk_id:2d} | "
-                      f"{joints_str} | "
-                      f"夹爪: {qpos[6]:5.2f}→{np.clip(action[6], 0.0, 1.0):5.2f} | {actual_freq:.1f}Hz")
+            timings['control'] = time.perf_counter() - t0
 
             # 可视化
+            t0 = time.perf_counter()
             if not args.headless:
                 try:
                     frames = [cv2.resize(frame, (320, 240)) for frame in display_frames]
@@ -463,13 +476,30 @@ def main():
                             break
                 except cv2.error:
                     args.headless = True
-
-            step_count += 1
+            timings['visualize'] = time.perf_counter() - t0
 
             # 频率控制
-            remaining = control_period - (time.time() - start_time)
+            remaining = control_period - (time.perf_counter() - loop_start)
             if remaining > 0:
+                t0 = time.perf_counter()
                 time.sleep(remaining)
+                timings['sleep'] = time.perf_counter() - t0
+
+            # 日志放在 sleep 之后，确保包含完整一轮的关键步骤耗时。
+            if step_count % 1 == 0:
+                joints_str = " ".join(
+                    f"J{i + 1}:{qpos[i]:6.1f}→{action[i]:6.1f}" for i in range(6)
+                )
+                timing_str = " ".join(
+                    f"{name}={duration * 1000:.1f}ms"
+                    for name, duration in timings.items()
+                )
+                print(f"[{policy_type}] Step {step_count:4d} | Chunk {chunk_id:2d} | "
+                    #   f"{joints_str} | "
+                      f"夹爪: {qpos[6]:5.2f}→{np.clip(action[6], 0.0, 1.0):5.2f} | "
+                      f"freq={actual_freq:.1f}Hz | {timing_str}")
+
+            step_count += 1
 
     except KeyboardInterrupt:
         print("\n\n推理终止")
