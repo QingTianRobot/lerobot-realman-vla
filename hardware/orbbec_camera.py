@@ -177,12 +177,22 @@ class OrbbecCamera:
             return self.latest_color.copy()
 
     def close(self):
+        """Stop the stream, wait for the Python reader, then release SDK state.
+
+        The SDK owns native worker threads. Releasing ``pipeline`` while the
+        reader is still inside ``wait_for_frames`` can make its C++ destructor
+        attempt to join the current/native thread and abort with
+        ``Resource deadlock avoided``.
+        """
         self.stopped = True
         if self.is_active and self.pipeline is not None:
             try:
                 self.pipeline.stop()
             except Exception:
                 pass
+        thread = getattr(self, "thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
         self.is_active = False
 
 

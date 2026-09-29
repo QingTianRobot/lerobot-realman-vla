@@ -7,6 +7,7 @@ SmolVLA / Pi0.5 推理脚本 — RealMan RM65
 
 特性:
   - 自动从 config.json 检测策略类型
+  - 默认使用 LeRobot 0.4.3 原生 RTC，后台生成 chunk，与动作执行重叠
   - EMA 动作平滑 + 死区过滤（减少抖动）
   - 异步夹爪控制（Modbus 写入不阻塞主循环）
   - VLA: Language instruction 支持
@@ -32,6 +33,8 @@ import threading
 import cv2
 import json
 import argparse
+import math
+from importlib.metadata import version
 from pathlib import Path
 
 # ============ 默认硬件配置（根据你的硬件修改） ============
@@ -56,9 +59,6 @@ INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.
 _HARDWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hardware')
 if _HARDWARE_DIR not in sys.path:
     sys.path.insert(0, _HARDWARE_DIR)
-from orbbec_camera import OrbbecCamera              # 腕部相机 (奥比中光)
-from realsense_camera import RealSenseCamera        # 顶部相机 (Intel RealSense D435)
-from changingtek_gripper import ChangingtekGripper   # 知行夹爪
 
 
 # ============ 版本兼容性补丁 ============
@@ -291,11 +291,30 @@ def main():
     parser.add_argument('--wait-for-next-chunk', '--wait_for_next_chunk',
                         dest='wait_for_next_chunk', action='store_true',
                         help='每次生成新动作 chunk 前等待 Enter 确认')
+    parser.add_argument('--rtc', action=argparse.BooleanOptionalAction, default=None,
+                        help='原生 RTC 异步推理，默认开启；--no-rtc 恢复串行模式')
+    parser.add_argument('--rtc-delay-ms', type=float, default=125.0,
+                        help='初始推理延迟估计(ms)，运行中按实测最大延迟上调，默认 %(default)s')
+    parser.add_argument('--rtc-margin-steps', type=int, default=2,
+                        help='提前推理的额外控制步数，默认 %(default)s')
+    parser.add_argument('--rtc-execution-horizon', type=int, default=10,
+                        help='RTC 前缀引导范围，至少覆盖延迟+余量，默认 %(default)s')
     parser.add_argument('--ema-alpha', type=float, default=0.3,
                         help='EMA 系数 (默认 %(default)s; 1.0=不平滑)')
     parser.add_argument('--deadzone', type=float, default=0.5,
                         help='关节死区阈值(度), 默认 %(default)s; 0=不过滤')
     args = parser.parse_args()
+    if not math.isfinite(args.freq) or args.freq <= 0:
+        parser.error('--freq 必须为正的有限数')
+    if args.rtc and args.wait_for_next_chunk:
+        parser.error('--rtc 与 --wait-for-next-chunk 不能同时使用')
+    if args.rtc is None:
+        args.rtc = not args.wait_for_next_chunk
+    installed_version = version('lerobot')
+    print(f"LeRobot: {installed_version} | Python: {sys.executable}")
+    if args.rtc:
+        from rtc_inference import RTCInference, check_lerobot_version
+        check_lerobot_version()
 
     if args.offline:
         import os
@@ -306,6 +325,9 @@ def main():
     from Robotic_Arm.rm_robot_interface import (
         RoboticArm, rm_thread_mode_e
     )
+    from orbbec_camera import OrbbecCamera
+    from realsense_camera import RealSenseCamera
+    from changingtek_gripper import ChangingtekGripper
     from lerobot.processor.pipeline import DataProcessorPipeline
 
     print("=" * 50)
@@ -322,6 +344,21 @@ def main():
         args.model, config_filename='policy_preprocessor.json')
     postprocessor = DataProcessorPipeline.from_pretrained(
         args.model, config_filename='policy_postprocessor.json')
+
+    rtc = None
+    if args.rtc:
+        rtc = RTCInference(
+            policy, preprocessor, postprocessor, freq=args.freq,
+            delay_ms=args.rtc_delay_ms, margin_steps=args.rtc_margin_steps,
+            execution_horizon=args.rtc_execution_horizon,
+        )
+        print(f"      RTC: ON | chunk={rtc.chunk_size}, replan target={rtc.replan_steps} steps, "
+              f"delay={rtc.delay_steps}+{rtc.margin_steps} reserve steps")
+    else:
+        # Checkpoints may already contain an enabled RTC config; select_action forbids it.
+        policy.config.rtc_config = None
+        policy.init_rtc_processor()
+        print("      RTC: OFF (串行 / 人工逐 chunk 模式)")
 
     # 检测输入特征
     input_features = policy.config.input_features
@@ -404,8 +441,18 @@ def main():
             prev_loop_start = loop_start
             timings = {}
 
+            # 仅检查 Future；推理未完成时继续消费已有动作，不等待 GPU。
+            if rtc:
+                t0 = time.perf_counter()
+                rtc.poll()
+                timings['rtc_poll'] = time.perf_counter() - t0
+                chunk_id = rtc.chunk_id
+            need_observation = rtc is None or rtc.needs_observation()
+
             # chunk 边界检测: 队列空 → 本步将触发一次前向重规划(新 chunk)
-            if action_queue is not None:
+            if rtc:
+                is_new_chunk = False
+            elif action_queue is not None:
                 is_new_chunk = (len(action_queue) == 0)
             else:
                 is_new_chunk = True
@@ -417,45 +464,58 @@ def main():
                 timings['wait'] = time.perf_counter() - t0
 
             # 获取观测
-            t0 = time.perf_counter()
+            observation_time = time.perf_counter()
             qpos = robot.get_qpos()
             observation = {
                 'observation.state': torch.from_numpy(qpos).float(),
             }
             display_frames = []
 
-            if cam_top:
+            if cam_top and (need_observation or not args.headless):
                 image_tensor, frame_bgr = _capture_image_tensor(cam_top)
                 observation['observation.images.camera_global'] = image_tensor
                 display_frames.append(frame_bgr)
 
-            if cam_wrist:
+            if cam_wrist and (need_observation or not args.headless):
                 image_tensor, frame_bgr = _capture_image_tensor(cam_wrist)
                 observation['observation.images.camera_left'] = image_tensor
                 display_frames.append(frame_bgr)
-            timings['observe'] = time.perf_counter() - t0
+            timings['observe'] = time.perf_counter() - observation_time
 
             # VLA 需要 language instruction
             if policy_type in ("pi05", "smolvla"):
                 observation['task'] = args.task
 
-            # 预处理 → 推理 → 后处理
-            t0 = time.perf_counter()
-            observation = preprocessor(observation)
-            timings['preprocess'] = time.perf_counter() - t0
+            if rtc:
+                if need_observation:
+                    rtc.submit(observation, observation_time=observation_time)
+                if rtc.chunk_id == 0:
+                    # 仅首次启动允许等待：此时尚无动作可与推理重叠。
+                    warmup_start = time.perf_counter()
+                    rtc.poll(wait=True)
+                    print(f"[RTC] 首段就绪: {(time.perf_counter() - warmup_start) * 1000:.1f}ms")
+                    loop_start = time.perf_counter()
+                    prev_loop_start = loop_start
+                action = rtc.pop()
+                chunk_id = rtc.chunk_id
+            else:
+                # 串行模式保留，用于对照及人工逐 chunk 检查。
+                t0 = time.perf_counter()
+                observation = preprocessor(observation)
+                timings['preprocess'] = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                action_tensor = policy.select_action(observation)
-            timings['inference'] = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    action_tensor = policy.select_action(observation)
+                timings['inference'] = time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            action_dict = postprocessor({'action': action_tensor})
-            action = action_dict['action'][0].cpu().numpy()
-            timings['postprocess'] = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                action_dict = postprocessor({'action': action_tensor})
+                action = action_dict['action'][0].cpu().numpy()
+                timings['postprocess'] = time.perf_counter() - t0
 
-            if is_new_chunk:
-                chunk_id += 1
+                if is_new_chunk:
+                    chunk_id += 1
 
             # 执行
             t0 = time.perf_counter()
@@ -494,6 +554,10 @@ def main():
                     f"{name}={duration * 1000:.1f}ms"
                     for name, duration in timings.items()
                 )
+                if rtc:
+                    timing_str += (f" | RTC queue={rtc.queue.qsize()} "
+                                   f"async={rtc.last_latency * 1000:.1f}ms "
+                                   f"skip={rtc.last_delay} budget={rtc.delay_steps}")
                 print(f"[{policy_type}] Step {step_count:4d} | Chunk {chunk_id:2d} | "
                     #   f"{joints_str} | "
                       f"夹爪: {qpos[6]:5.2f}→{np.clip(action[6], 0.0, 1.0):5.2f} | "
@@ -504,18 +568,35 @@ def main():
     except KeyboardInterrupt:
         print("\n\n推理终止")
     finally:
+        # Shutdown order matters: stop camera SDK worker threads before native
+        # arm/gripper teardown. Otherwise Ctrl+C can make a C++ destructor join
+        # its own callback thread (std::system_error: Resource deadlock avoided).
+        try:
+            if rtc:
+                robot.stop()
+                rtc.close()
+        except Exception as e:
+            print(f"[!] RTC 退出清理失败: {type(e).__name__}: {e}")
+        for camera_name, camera in (("顶部相机", cam_top), ("腕部相机", cam_wrist)):
+            if camera:
+                try:
+                    camera.close()
+                except Exception as e:
+                    print(f"[!] {camera_name} 退出清理失败: {type(e).__name__}: {e}")
         # 退出前让机械臂回到 POS_INIT 并张开夹爪 (归位内部已含急停保护)
-        robot.homing_on_exit(INIT_POSE)
+        try:
+            robot.homing_on_exit(INIT_POSE)
+        except Exception as e:
+            print(f"[!] 机械臂归位清理失败: {type(e).__name__}: {e}")
         try:
             if not args.headless:
                 cv2.destroyAllWindows()
         except Exception:
             pass
-        robot.close()
-        if cam_top:
-            cam_top.close()
-        if cam_wrist:
-            cam_wrist.close()
+        try:
+            robot.close()
+        except Exception as e:
+            print(f"[!] 硬件释放失败: {type(e).__name__}: {e}")
         print("硬件已关闭")
 
 
