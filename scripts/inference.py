@@ -61,6 +61,12 @@ GRIPPER_COMPENSATION = -0.02
 # 与 collect_data.py ROBOT_INIT_POS + ROBOT_INIT_ORI 保持一致 (笛卡尔位姿 [x,y,z,rx,ry,rz], 米/弧度)
 INIT_POSE = np.array([-0.0847, -0.2821, 0.0872, -3.102, 0.065, 1.609], dtype=np.float32)
 
+# RealMan 状态读取不再放在 30 Hz 控制线程里同步调用。主线程只消费缓存，
+# 由后台线程按模式限频响应刷新请求；Pi0.5 RTC 推理较重，默认降低状态 RPC 频率。
+STATE_POLL_HZ_RTC = 10.0
+STATE_POLL_HZ_SERIAL = 30.0
+STATE_WARN_INTERVAL_S = 2.0
+
 # ------ 硬件模块路径 ------
 _HARDWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hardware')
 if _HARDWARE_DIR not in sys.path:
@@ -151,6 +157,17 @@ class RobotController:
         self.gripper = gripper
         self.lock = threading.Lock()
 
+        # RealMan SDK 状态读取可能阻塞约 0.5s。它必须和控制主线程解耦：
+        # 后台线程负责 RPC，主线程永远只读取最近一份缓存。
+        self._state_lock = threading.Lock()
+        self._state_request = threading.Event()
+        self._state_stop = threading.Event()
+        self._state_thread = None
+        self._cached_joint_angles = None
+        self._cached_state_time = None
+        self._last_state_warning = 0.0
+        self._state_failures = 0
+
         self._last_gripper_cmd = None
         self._smoothed_action = None
         self._last_joint_cmd = None
@@ -158,14 +175,106 @@ class RobotController:
         self.joint_deadzone = joint_deadzone  # 死区阈值(度)
 
     def get_qpos(self):
-        """获取当前 [6关节角 + 夹爪位置]"""
-        with self.lock:
-            joint_state = self.arm.rm_get_current_arm_state()
-            joint_angles = joint_state[1]['joint'][:6]
-            # 与采集端一致：使用夹爪后台轮询到的实时归一化反馈，而非上一次命令值。
-            gripper_pos = self.gripper.get_position_normalized()
+        """获取缓存的 [6关节角 + 夹爪位置]，绝不同步访问 RealMan SDK。"""
+        with self._state_lock:
+            if self._cached_joint_angles is None:
+                raise RuntimeError("RealMan 状态缓存尚未就绪")
+            joint_angles = self._cached_joint_angles.copy()
 
-            return np.array(joint_angles + [gripper_pos], dtype=np.float32)
+        # 与采集端一致：使用夹爪后台轮询到的实时归一化反馈。
+        gripper_pos = self.gripper.get_position_normalized()
+        return np.concatenate([joint_angles, [gripper_pos]]).astype(np.float32)
+
+    def request_state_update(self):
+        """请求后台刷新一次状态；调用方不会等待 SDK 返回。"""
+        if self._state_thread is not None:
+            self._state_request.set()
+
+    def state_age(self):
+        """返回缓存状态年龄（秒）；尚未成功读取时返回 None。"""
+        with self._state_lock:
+            if self._cached_state_time is None:
+                return None
+            return max(0.0, time.monotonic() - self._cached_state_time)
+
+    def start_state_monitor(self, poll_hz, initial_timeout=1.0):
+        """启动状态缓存线程，并在进入控制循环前等待首帧。"""
+        if self._state_thread is not None:
+            return
+        # 每次启动（尤其是 reset 后）都必须等一帧新的 RealMan 状态，
+        # 不能把 reset 前的关节缓存当成新 episode 的观测。
+        with self._state_lock:
+            self._cached_joint_angles = None
+            self._cached_state_time = None
+        period = 1.0 / max(float(poll_hz), 1.0)
+
+        def _state_loop():
+            next_allowed = 0.0
+            while not self._state_stop.is_set():
+                self._state_request.wait(0.2)
+                if self._state_stop.is_set():
+                    break
+                if not self._state_request.is_set():
+                    continue
+                self._state_request.clear()
+
+                delay = next_allowed - time.monotonic()
+                if delay > 0 and self._state_stop.wait(delay):
+                    break
+
+                try:
+                    # 这是唯一允许调用 rm_get_current_arm_state 的位置。
+                    result = self.arm.rm_get_current_arm_state()
+                    if not isinstance(result, (tuple, list)) or len(result) < 2:
+                        raise RuntimeError(f"返回值格式异常: {type(result).__name__}")
+                    code, state = result[0], result[1]
+                    if code != 0 or not isinstance(state, dict) or 'joint' not in state:
+                        raise RuntimeError(f"code={code}, state_type={type(state).__name__}")
+                    joints = np.asarray(state['joint'][:6], dtype=np.float32)
+                    if joints.shape != (6,) or not np.isfinite(joints).all():
+                        raise RuntimeError(f"关节状态无效: shape={joints.shape}")
+                    with self._state_lock:
+                        self._cached_joint_angles = joints
+                        self._cached_state_time = time.monotonic()
+                    self._state_failures = 0
+                except Exception as exc:
+                    self._state_failures += 1
+                    now = time.monotonic()
+                    if now - self._last_state_warning >= STATE_WARN_INTERVAL_S:
+                        age = self.state_age()
+                        age_text = "无可用缓存" if age is None else f"缓存年龄={age:.2f}s"
+                        print(f"[!] RealMan 状态后台读取失败 ({self._state_failures}次, {age_text}): "
+                              f"{type(exc).__name__}: {exc}")
+                        self._last_state_warning = now
+                finally:
+                    next_allowed = time.monotonic() + period
+
+        self._state_stop.clear()
+        self._state_request.clear()
+        self._state_thread = threading.Thread(
+            target=_state_loop, name="realman-state-cache", daemon=True)
+        self._state_thread.start()
+        self.request_state_update()
+        deadline = time.monotonic() + initial_timeout
+        while self._cached_joint_angles is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self._cached_joint_angles is None:
+            self.stop_state_monitor()
+            raise RuntimeError("RealMan 状态缓存首帧读取失败，无法安全开始推理")
+
+    def stop_state_monitor(self, wait=True):
+        """停止状态缓存线程。
+
+        reset/释放 SDK 前必须等待状态 RPC 线程退出，不能让 daemon 线程在
+        rm_delete_robot_arm() 之后继续访问 native SDK。正常控制路径不会调用此方法。
+        """
+        self._state_stop.set()
+        self._state_request.set()
+        thread = self._state_thread
+        if thread is not None and thread is not threading.current_thread() and wait:
+            thread.join()
+        if thread is None or not thread.is_alive():
+            self._state_thread = None
 
     def set_qpos(self, qpos):
         """设置目标关节角 + 夹爪
@@ -236,6 +345,7 @@ class RobotController:
             pass
 
     def close(self):
+        self.stop_state_monitor()
         try:
             self.gripper.disable()
             self.gripper.disconnect()
@@ -307,6 +417,10 @@ def main():
                         help='提前推理的额外控制步数，默认 %(default)s')
     parser.add_argument('--rtc-execution-horizon', type=int, default=10,
                         help='RTC 前缀引导范围，至少覆盖延迟+余量，默认 %(default)s')
+    parser.add_argument('--state-poll-hz-rtc', type=float, default=STATE_POLL_HZ_RTC,
+                        help='RTC 模式请求 RealMan 状态的最高频率，默认 %(default)sHz')
+    parser.add_argument('--state-poll-hz-serial', type=float, default=STATE_POLL_HZ_SERIAL,
+                        help='非 RTC 模式请求 RealMan 状态的最高频率，默认 %(default)sHz')
     parser.add_argument('--ema-alpha', type=float, default=0.3,
                         help='EMA 系数 (默认 %(default)s; 1.0=不平滑)')
     parser.add_argument('--deadzone', type=float, default=0.5,
@@ -318,6 +432,9 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.freq) or args.freq <= 0:
         parser.error('--freq 必须为正的有限数')
+    for name in ('state_poll_hz_rtc', 'state_poll_hz_serial'):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f'--{name.replace("_", "-")} 必须为正的有限数')
     if args.rtc and args.wait_for_next_chunk:
         parser.error('--rtc 与 --wait-for-next-chunk 不能同时使用')
     if args.rtc is None:
@@ -418,6 +535,10 @@ def main():
     time.sleep(1)
 
     # 3. Optional runtime reset hotkey. The initial arm pose is left untouched.
+    state_poll_hz = args.state_poll_hz_rtc if args.rtc else args.state_poll_hz_serial
+    print(f"      RealMan 状态缓存: {state_poll_hz:.1f}Hz (主线程不阻塞 SDK 状态读取)")
+    robot.start_state_monitor(state_poll_hz)
+
     reset_requested = threading.Event()
     reset_listener_stop = threading.Event()
     if args.reset_and_run:
@@ -463,6 +584,7 @@ def main():
     action_queue = _get_action_queue(policy)   # 须在 reset() 之后取, 保证与 select_action 同一 deque
     chunk_id = 0
     prev_loop_start = None
+    reset_generation = 0
 
     try:
         while True:
@@ -479,7 +601,12 @@ def main():
 
             if reset_requested.is_set():
                 reset_requested.clear()
-                print("\n[RESET] r received: stopping motion and resetting arm...")
+                reset_generation += 1
+                print(f"\n[RESET {reset_generation}] r received: stopping motion and resetting arm...")
+                # 不允许状态 RPC 与 stop/movej/队列 reset 并发进行。
+                # 这里可以等待一个已卡住的状态 RPC；这是 reset 的安全屏障，
+                # 正常控制循环不会等待它。
+                robot.stop_state_monitor(wait=True)
                 robot.stop()
                 robot.move_to_init(INIT_POSE)
                 if rtc:
@@ -491,7 +618,8 @@ def main():
                 chunk_id = 0
                 step_count = 0
                 prev_loop_start = None
-                print("[RESET] arm reset complete; inference resumed")
+                robot.start_state_monitor(state_poll_hz)
+                print(f"[RESET {reset_generation}] arm reset complete; inference resumed")
 
             # 仅检查 Future；推理未完成时继续消费已有动作，不等待 GPU。
             if rtc:
@@ -499,6 +627,9 @@ def main():
                 rtc.poll()
                 timings['rtc_poll'] = time.perf_counter() - t0
                 chunk_id = rtc.chunk_id
+            # r 可能在 poll/inference 期间到达；不要在本轮继续消费旧动作。
+            if reset_requested.is_set():
+                continue
             need_observation = rtc is None or rtc.needs_observation()
 
             # chunk 边界检测: 队列空 → 本步将触发一次前向重规划(新 chunk)
@@ -514,6 +645,11 @@ def main():
                 t0 = time.perf_counter()
                 wait_for_next_chunk(chunk_id + 1)
                 timings['wait'] = time.perf_counter() - t0
+
+            # 只有真正需要新观测时才请求后台刷新 RealMan 状态。
+            # request_state_update() 立即返回，qpos 始终读取最近缓存。
+            if need_observation:
+                robot.request_state_update()
 
             # 获取观测
             observation_time = time.perf_counter()
@@ -569,6 +705,11 @@ def main():
                 if is_new_chunk:
                     chunk_id += 1
 
+            # reset 可能在推理、预处理或相机读取期间到达；丢弃本轮 action，
+            # 下一轮先执行 reset 分支，避免旧动作穿过 reset 边界。
+            if reset_requested.is_set():
+                continue
+
             # 执行
             t0 = time.perf_counter()
             robot.set_qpos(action)
@@ -615,8 +756,8 @@ def main():
                                    f"skip={rtc.last_delay} budget={rtc.delay_steps}")
                 print(f"[{policy_type}] Step {step_count:4d} | Chunk {chunk_id:2d} | "
                     #   f"{joints_str} | "
-                      f"夹爪: {qpos[6]:5.2f}→{np.clip(action[6], 0.0, 1.0):5.2f} | "
-                      f"freq={actual_freq:.1f}Hz | {timing_str}")
+                    f"夹爪: {qpos[6]:5.2f}→{np.clip(action[6], 0.0, 1.0):5.2f} | "
+                      f"freq={actual_freq:.1f}Hz state_age={robot.state_age() or 0.0:.2f}s | {timing_str}")
 
             step_count += 1
 
@@ -639,6 +780,8 @@ def main():
                     camera.close()
                 except Exception as e:
                     print(f"[!] {camera_name} 退出清理失败: {type(e).__name__}: {e}")
+        # 先停止后台状态 RPC，再执行归位和释放 RealMan SDK，避免退出时并发访问。
+        robot.stop_state_monitor()
         # 退出前让机械臂回到 POS_INIT 并张开夹爪 (归位内部已含急停保护)
         try:
             robot.homing_on_exit(INIT_POSE)

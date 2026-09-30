@@ -148,9 +148,12 @@ class RTCInference:
             self._future.result()
             self._future = None
         self.policy.reset()
-        self.queue.queue = None
-        self.queue.original_queue = None
-        self.queue.last_index = 0
+        # Queue access normally belongs to this control thread, but clear both
+        # tensors under ActionQueue's lock so reset is an atomic queue boundary.
+        with self.queue.lock:
+            self.queue.queue = None
+            self.queue.original_queue = None
+            self.queue.last_index = 0
         self.chunk_id = 0
         self.last_delay = 0
         self.last_latency = 0.0

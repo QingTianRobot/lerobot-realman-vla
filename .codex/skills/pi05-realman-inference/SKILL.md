@@ -64,3 +64,62 @@ Use this skill when a user asks how to run, validate, or troubleshoot a locally 
 - `Repo id must be in the form ... /home/.../paligemma-3b-pt-224` means `tokenizer_name` points to a nonexistent absolute path. Repair the checkpoint's `policy_preprocessor.json`.
 - `An incorrect transformer version is used` or missing `transformers.models.siglip.check` means the OpenPI compatibility branch is not installed in the active venv.
 - If one checkpoint works and another fails at tokenizer initialization, compare their `policy_preprocessor.json`; each checkpoint stores its own copy.
+
+## Concurrency and reset audit
+
+The current inference process has four relevant execution contexts:
+
+1. The main control loop: reads observations, polls RTC, pops an action, sends CANFD commands, and handles the reset event.
+2. The reset listener thread: in headless mode, puts stdin in cbreak mode and sets `reset_requested` when it reads `r`; it never moves the arm or clears queues itself.
+3. The RTC worker thread: owns preprocessing, Pi0.5 inference, and postprocessing through a single `ThreadPoolExecutor` worker. It does not call the robot SDK.
+4. The RealMan state-cache thread: performs the only `rm_get_current_arm_state()` calls and publishes the newest six-joint snapshot under `_state_lock`.
+
+### What reset currently does
+
+The main loop checks `reset_requested` only at the beginning of an iteration. It then:
+
+```text
+robot.stop()
+robot.move_to_init(INIT_POSE)
+if RTC:
+    rtc.reset()
+    # rtc.reset waits for the old Future, then sets ActionQueue.queue/original_queue=None
+else:
+    policy.reset()
+    action_queue = _get_action_queue(policy)
+reset counters
+```
+
+For serial mode, `policy.reset()` creates new deques and the local `action_queue` is reacquired, so the old policy queue is discarded.
+
+For RTC mode, `rtc.reset()` does clear both RTC queues (`queue` and `original_queue`) and resets `last_index`, `chunk_id`, delay bookkeeping, and policy state. However, it first calls `_future.result()`. Therefore queue clearing is delayed until the previous Pi0.5 inference finishes; it is not cancellation. The queue is not merged by another thread because `poll()`/`pop()`/`reset()` are called by the main thread only.
+
+### Fixed reset and safety behavior
+
+The current project implementation now applies these protections:
+
+- `rtc.reset()` clears `ActionQueue.queue`, `original_queue`, and `last_index` under the queue lock after the old Future has completed.
+- The main loop checks `reset_requested` after RTC polling and again after preprocessing/inference, before `rtc.pop()`/`robot.set_qpos()`. An action computed across a reset boundary is discarded.
+- Reset stops and joins the RealMan state-cache thread before `rm_set_arm_stop()` and `rm_movej_p()`, then starts a fresh state-cache thread after homing.
+- State-cache shutdown waits for the SDK call to return before the arm handle can be deleted. This is intentionally a blocking safety barrier during reset/shutdown only; the normal control loop never waits for the state RPC.
+- A reset generation counter is printed in the `[RESET N]` messages so logs distinguish old and new episodes.
+
+### Remaining timing semantics and safety implications
+
+- If `r` arrives after the final pre-send check but during the native `robot.set_qpos()` call, that one command cannot be preempted by Python; the next loop handles reset. This is the unavoidable non-preemptible SDK call boundary.
+- If `r` arrives while the RTC worker is computing, the main thread stops/homes the arm and then waits in `rtc.reset()` for the stale Future. No stale action should be merged after `reset()` because the main thread owns `poll()` and `merge()`, but reset latency can be as long as the Pi0.5 inference latency.
+- Repeated `r` presses are coalesced by `threading.Event`; they do not queue multiple resets. This is desirable, but a reset-generation counter is needed if future code must distinguish events that arrive during a reset.
+- During normal operation, the state-cache RPC and motion calls remain separate SDK calls from different threads. The reset/shutdown barrier prevents the especially dangerous stop/homing/delete races; if the vendor SDK requires all calls to be serialized, add a vendor-safe SDK I/O lock as a separate change and measure its effect on control latency.
+
+### Required design for a safe future reset fix
+
+Do not fix reset by merely assigning `action_queue = None`. Preserve these invariants:
+
+- A reset must invalidate the current RTC generation before any next action can be sent.
+- The control loop must check the reset generation immediately before `rtc.pop()`/`robot.set_qpos()` and discard an action if reset was requested during polling.
+- RTC reset must stop accepting/merging the old Future result, then clear both processed and original queues atomically from the control thread.
+- The state-cache thread and every arm SDK command need one shared arm-I/O synchronization policy. If SDK calls can block, shutdown must not destroy the SDK handle until the state call has exited; a timed daemon join is insufficient.
+- During reset, state refresh should be invalidated or marked stale, the arm should be stopped/homed, then a fresh state sample should be obtained before submitting the next observation.
+- Add a reset generation/id to logs so stale actions and post-reset actions can be distinguished.
+
+When modifying reset or state-cache code, test at least these cases with fake SDK/policy objects before connecting hardware: reset while no RTC Future exists; reset while the RTC Future is running; repeated `r`; state RPC failure with a valid cache; state RPC blocked during reset; and shutdown while a state RPC is blocked.
