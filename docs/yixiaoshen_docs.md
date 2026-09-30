@@ -6,7 +6,7 @@ python scripts/collect_data.py \
 
 
 
-# 模型推理脚本
+# smolVLA模型推理脚本
 
 cd /home/robot/repo/lerobot-realman-vla
 export DISPLAY=:1 ; export XAUTHORITY=/run/user/1000/gdm/Xauthority
@@ -14,4 +14,17 @@ source ./env.sh
 python scripts/inference.py \
     --model /home/robot/repo/lerobot-realman-vla/outputs/smolvla_realman_sztu/checkpoints/070000/pretrained_model \
     --task "pick up the plug and place it in the box" \
-    --freq 30 --ema-alpha 0.7 --deadzone 0 --offline --headless --reset-and-run
+    --freq 30 --ema-alpha 0.7 --deadzone 0 --offline --headless
+
+
+# pi05模型推理脚本
+cd /home/robot/repo/lerobot-realman-vla
+source ./env.sh
+python scripts/inference.py \
+  --model /home/robot/repo/lerobot-realman-vla/outputs/pi05_realman_sztu/checkpoints/005000/pretrained_model \
+  --task "pick up the plug and place it in the box" \
+  --freq 30 \
+  --ema-alpha 0.7 \
+  --deadzone 0 \
+  --offline \
+  --headless

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi0.5 RealMan 推理"
+  short_description: "排查并运行本地 LeRobot 0.4.3 Pi0.5 RealMan checkpoint"
+  default_prompt: "检查本地 Pi0.5 checkpoint、修复跨机器路径并验证离线推理环境"
