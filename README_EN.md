@@ -69,11 +69,39 @@ python scripts/convert_to_lerobot.py \
 bash scripts/train.sh act
 
 # Inference
+source env.sh
 python scripts/inference.py \
-    --model outputs/act_realman/checkpoints/100000/pretrained_model \
+    --model outputs/smolvla_realman_sztu/checkpoints/100000/pretrained_model \
     --arm-ip <YOUR_ARM_IP> \
-    --freq 30
+    --freq 30 --task "pick up the cube" --offline
 ```
+
+Continuous SmolVLA / Pi0.5 inference defaults to native **LeRobot 0.4.3 RTC**,
+with preprocessing, chunk prediction and postprocessing on a worker thread.
+The control loop executes queued CPU actions while the next chunk is generated
+using the unexecuted normalized prefix. Queue replacement skips exactly the
+actions consumed during inference. The full predicted chunk remains available
+as a reserve; `n_action_steps` controls the replan interval.
+
+`--rtc-delay-ms 125` seeds the adaptive latency estimate; `--rtc-margin-steps 2`
+adds a reserve. At 30 Hz this initially reserves 4 + 2 steps. Logs report `async`
+latency, remaining `queue`, discarded prefix `skip`, and delay `budget` in steps.
+Only startup waits for the first chunk. An underrun raises an error and enters
+the existing stop/homing cleanup. Use `--no-rtc` for serial execution;
+`--wait-for-next-chunk` automatically selects serial mode and conflicts with
+explicit `--rtc`. No checkpoint retraining is required.
+
+Per-step control logs are disabled by default; add `--print-step` to enable them.
+With `--reset-and-run`, pressing `r` during inference (no Enter required) stops
+the current motion, moves to `INIT_POSE`, clears stale actions, and resumes
+inference. It can be triggered repeatedly.
+
+Gripper commands receive the `GRIPPER_COMPENSATION` constant in
+`scripts/inference.py` before being sent. It is currently `-0.03`: normalized
+`0` means closed and `1` means open, so the negative offset closes slightly
+further to improve grip stability.
+
+Hardware-free checks: `.venv/bin/python -m unittest discover -s tests -v`.
 
 ---
 

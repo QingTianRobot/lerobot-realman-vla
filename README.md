@@ -233,13 +233,44 @@ bash scripts/train.sh act resume
 ### 5. 推理
 
 ```bash
+source env.sh
 python scripts/inference.py \
-    --model outputs/act_realman/checkpoints/100000/pretrained_model \
+    --model outputs/smolvla_realman_sztu/checkpoints/100000/pretrained_model \
     --arm-ip 192.168.5.123 \
     --gripper-port /dev/realman/gripper_left \
     --cam-top 262322074840 \
     --cam-wrist CV2T66100096 \
-    --freq 30
+    --freq 30 --task "pick up the cube" --offline
+```
+
+SmolVLA / Pi0.5 连续推理默认使用 **LeRobot 0.4.3 原生 RTC**。启动时打印当前
+Python 路径并检查 LeRobot 版本；第一段动作准备好后，控制线程持续从官方
+`ActionQueue` 取动作，后台线程执行预处理、`predict_action_chunk()` 和后处理。
+下一段预测使用上一段尚未执行的归一化动作做 RTC 前缀引导；替换队列时，按推理期间
+**实际执行的步数**跳过新段中过期的动作，避免每个 chunk 边界等待推理。
+
+- `--rtc-delay-ms 125`：初始延迟估计，运行时按实测端到端最大延迟自动上调。
+  30 Hz 下 125 ms 对应向上取整的 4 步；`--rtc-margin-steps 2` 再留 2 步余量。
+- 保留全部 `chunk_size` 动作作为储备；以 checkpoint 的 `n_action_steps` 为重规划
+  间隔，储备不足以覆盖延迟和余量时提前重规划。不会把完整预测截断到 `n_action_steps`。
+- `--rtc-execution-horizon 10`：原生 RTC 的前缀引导范围；实际使用值至少覆盖延迟加余量。
+- 日志中的 `async` 是后台端到端耗时（含观测采集和完成结果轮询），不代表控制线程阻塞；
+  `queue` 是剩余动作数，`skip` 是最近切换跳过的步数，`budget` 是当前延迟估计步数。
+- `--no-rtc` 恢复串行模式，便于对照。`--wait-for-next-chunk` 自动使用串行模式；
+  显式同时指定 `--rtc` 和人工逐段确认会报错。
+
+首次启动仍需等待首段推理。若推理慢到耗尽完整动作储备，程序会报错并进入停止/归位流程，
+不会重复旧动作或在控制循环里等待推理；此时需降低控制频率或缩短模型推理耗时。
+RTC 使用原生引导，不需要重新训练 checkpoint。
+
+逐步控制日志默认关闭；需要时添加 `--print-step`。添加 `--reset-and-run` 后，推理运行期间直接按 `r`（无需 Enter）会停止当前动作、复位到 `INIT_POSE`、清空旧动作队列，然后继续推理；可重复触发。
+
+夹爪实际下发值会统一加上 `scripts/inference.py` 中的 `GRIPPER_COMPENSATION`（当前为 `-0.03`）。由于归一化值 `0` 表示闭合、`1` 表示张开，负值会让夹爪额外闭合以提高抓取稳定性。
+
+无需连接硬件的 RTC 回归检查：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 ---

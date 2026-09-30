@@ -109,6 +109,9 @@ class RealSenseCamera:
                 self.pipeline.stop()
             except Exception:
                 pass
+        thread = getattr(self, "thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
         self.is_active = False
 
 
