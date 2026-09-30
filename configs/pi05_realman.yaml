@@ -1,0 +1,85 @@
+# Pi0.5 (pi05) 训练配置 - RealMan RM65
+#
+# Pi0.5 是 Physical Intelligence 在 pi0 之上的升级版
+# 把机器人 state 离散化成 token 拼进语言 prompt，开放世界泛化更强
+# VLM 骨干 = PaliGemma (2B) + gemma_300m Action Expert
+#
+# ⚠️ 硬件要求: 24GB+ VRAM (RTX 3090/4090)
+#
+# 用法:
+#   python -m lerobot.scripts.lerobot_train --config configs/pi05_realman.yaml
+
+dataset:
+  repo_id: local_dataset
+  root: data/datasets/20260924_SZTU_trimmed/20260924_SZTU_trimmed
+  video_backend: pyav
+
+policy:
+  type: pi05
+  repo_id: yixiaoshen/smolvla_20260924_realman_pick_plug
+
+  # ⭐ fine-tune 起点 —— 本地 lerobot/pi05_base (14.4GB, 未 gated)
+  # policy_preprocessor.json 里 tokenizer_name 已改为本地 models/paligemma-3b-pt-224
+  pretrained_path: models/pi05_base
+
+  # Pi0.5 核心参数
+  n_obs_steps: 4
+  chunk_size: 50
+  n_action_steps: 20
+
+  # VLM 骨干
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  dtype: bfloat16
+
+  # 图像预处理
+  image_resolution: [224, 224]
+  tokenizer_max_length: 200      # pi05 把离散 state token 拼进 prompt，需更长
+
+  # Flow Matching
+  num_inference_steps: 10
+  time_sampling_beta_alpha: 1.5
+  time_sampling_beta_beta: 1.0
+
+  # ⭐ 显存优化（关键！）
+  freeze_vision_encoder: true    # 冻结视觉编码器
+  train_expert_only: true        # 只训练 Action Expert + 投影层
+  gradient_checkpointing: true
+
+  # 优化器
+  optimizer_lr: 2.5e-5
+  optimizer_betas: [0.9, 0.95]
+  optimizer_weight_decay: 0.01
+  optimizer_grad_clip_norm: 1.0
+
+  # 学习率调度
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 5000
+  scheduler_decay_lr: 2.5e-6
+
+batch_size: 16
+steps: 50000
+
+save_checkpoint: true
+save_freq: 5000
+eval_freq: 5000
+log_freq: 100
+
+output_dir: outputs/pi05_realman_sztu
+
+seed: 42
+num_workers: 8
+
+wandb:
+  enable: true
+  project: smolvla_realman
+  entity: fusedbuzzer-awd
+  notes: "pi0.5, SZTU trimmed dataset, RealMan RM65"
+  run_id: 20260929_pi05
+
+# 显存估算:
+# gemma_2b + freeze + train_expert_only + gradient_checkpointing: ~10-14GB
+# RTX 3090/4090 24GB: batch_size=2 勉强
+# 如果 OOM:
+#   1. batch_size: 1
+#   2. paligemma_variant: gemma_300m
